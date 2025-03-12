@@ -1,18 +1,17 @@
+const sql = require("./src/config/db");
 const express = require("express");
 const app = express();
 const { App } = require("@slack/bolt");
 const dotenv = require("dotenv");
-// const { default: OpenAI } = require("openai");
+const { default: OpenAI } = require("openai");
 const logger = require("./src/libs/loggerConfig");
 const supabase = require("./src/libs/supabaseClient");
-const { HfInference } = require("@huggingface/inference");
-const { format } = require("date-fns");
 
 dotenv.config();
 
 app.use(express.json());
 
-// console.log("keyyyyyyyy", process.env.OPENAI_API_KEY);
+console.log("keyyyyyyyy", process.env.OPENAI_API_KEY);
 
 // Initialize Slack app
 const slackApp = new App({
@@ -23,12 +22,9 @@ const slackApp = new App({
 });
 
 // Initialize OpenAI
-// const openai = new OpenAI({
-//   apiKey: process.env.OPENAI_API_KEY,
-// });
-
-// Initialize Hugging Face Inference API
-const hf = new HfInference(process.env.HUGGING_FACE_API_KEY);
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // ✅ message.channels → For messages in public channels.
 // ✅ message.groups → For messages in private channels (needed if you're using private channels).
@@ -44,7 +40,7 @@ slackApp.event("message", async ({ event, client }) => {
   try {
     // Only process messages from actual users (not bots)
     if (event.subtype === undefined && event.bot_id === undefined) {
-      // logger.info(`Received message: ${event.text}`);
+      logger.info(`Received message: ${event.text}`);
 
       // Get user info
       const userInfo = await client.users.info({
@@ -68,21 +64,21 @@ slackApp.event("message", async ({ event, client }) => {
         parseMessageDetails(event);
 
       // Log the structured data
-      // const logData = {
-      //   user_name: userName,
-      //   timestamp: new Date(parseInt(event.ts) * 1000).toISOString(),
-      //   email: email,
-      //   user_id: event.user,
-      //   category: category,
-      //   reason: reason || "N/A",
-      //   is_working_from_home: isWorkingFromHome,
-      //   is_leave_requested: isLeaveRequest,
-      //   is_running_late: isRunningLate,
-      // };
+      const logData = {
+        user_name: userName,
+        timestamp: new Date(parseInt(event.ts) * 1000).toISOString(),
+        email: email,
+        user_id: event.user,
+        category: category,
+        reason: reason || "N/A",
+        is_working_from_home: isWorkingFromHome,
+        is_leave_requested: isLeaveRequest,
+        is_running_late: isRunningLate,
+      };
 
       // Log to console and file
-      // console.log("Attendance record:", JSON.stringify(logData));
-      // logger.info("Attendance record", logData);
+      console.log("Attendance record:", JSON.stringify(logData));
+      logger.info("Attendance record", logData);
 
       // Store in database
       await storeAttendanceData({
@@ -111,7 +107,7 @@ slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   await ack();
 
   try {
-    // logger.info(`Received query: ${command.text}`);
+    logger.info(`Received query: ${command.text}`);
     const result = await processQuery(command.text);
     await respond(result);
   } catch (error) {
@@ -120,58 +116,51 @@ slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   }
 });
 
-// Function to classify message using Hugging Face API
+// Function to classify message using OpenAI
 async function classifyMessage(message) {
-  try {
-    // Use a more instruction-tuned model
-    const response = await hf.textGeneration({
-      model: "mistralai/Mistral-7B-Instruct-v0.2", // Better instruction-following model
-      inputs: `<s>[INST] You are a helpful assistant that categorizes attendance messages.
-Categorize the following message into exactly one of these categories:
-1. WFH (Work From Home)
-2. FULL DAY LEAVE
-3. HALF DAY LEAVE
-4. LATE TO OFFICE
-5. LEAVING EARLY
-Respond with ONLY the category name in uppercase, nothing else.
+  const response = await openai.chat.completions.create({
+    model: "gpt-3.5-turbo",
+    messages: [
+      {
+        role: "system",
 
-Message: ${message} [/INST]</s>`,
-      parameters: {
-        max_new_tokens: 20, // Enough for the category name
-        temperature: 0.1, // Lower temperature for more deterministic outputs
-        do_sample: false, // Don't use sampling for classification
-        return_full_text: false, // Don't include the prompt in the output
+        // content:
+        // "You are a helpful assistant that categorizes attendance messages. " +
+        // "Categorize the following message into exactly one of these categories: " +
+        // "WFH, FULL DAY LEAVE, HALF DAY LEAVE, LATE TO OFFICE, LEAVING EARLY. " +
+        // "Respond with only the category name.",
+
+        // content:
+        //   "You are a helpful assistant that categorizes attendance messages. " +
+        //   "Categorize the following message into exactly one of these categories: " +
+        //   "WFH, FULL DAY LEAVE, HALF DAY LEAVE, LATE TO OFFICE, LEAVING EARLY. " +
+        //   "Respond with only the category name.",
+
+        content: `You are a helpful assistant that translates natural language queries about attendance data into JSON format for database queries.
+                  The database has a table called 'leave_table' with columns: id, user_id, user_name, timestamp, message, category, is_working_from_home, is_leave_requested, is_running_late, first_name, last_name, is_coming_late, is_leave_early, email.
+                  Valid categories are: wfh, full_leave, half_leave, leave_early, come_late.
+                  Format your response as a JSON object with these properties:
+                  - queryType: 'count', 'list', 'trend', or 'summary'
+                  - category: the attendance category to filter by (if applicable)
+                  - timeFrame: 'day', 'week', 'month', 'quarter', or custom date range as {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD'}
+                  - groupBy: 'user', 'day', 'category' (if applicable)
+                  - limit: number of results to return (if applicable)
+                  - filters: additional filters for boolean fields like is_working_from_home, is_leave_requested, is_running_late (if applicable)
+                  Respond with valid JSON only.`,
       },
-    });
+      {
+        role: "user",
+        content: message,
+      },
+    ],
+    temperature: 0.3,
+    max_tokens: 10,
+  });
 
-    // Clean the response to extract just the category
-    let category = response.generated_text.trim();
+  const category = response.choices[0].message.content.trim();
+  const confidence = 0.9; // Note: GPT doesn't provide confidence scores directly
 
-    // Extract just the category if it contains other text
-    const categoryPatterns = [
-      /WFH|WORK FROM HOME/i,
-      /FULL DAY LEAVE/i,
-      /HALF DAY LEAVE/i,
-      /LATE TO OFFICE/i,
-      /LEAVING EARLY/i,
-    ];
-
-    for (const pattern of categoryPatterns) {
-      const match = category.match(pattern);
-      if (match) {
-        category = match[0].toUpperCase();
-        break;
-      }
-    }
-
-    console.log("Classified category:", category);
-    const confidence = 0.9; // Placeholder since HF doesn't provide confidence scores
-
-    return { category, confidence };
-  } catch (error) {
-    console.error(`Error classifying message with Hugging Face: ${error}`);
-    throw error;
-  }
+  return { category, confidence };
 }
 
 // Function to parse additional details from the message
@@ -232,157 +221,91 @@ function parseMessageDetails(event) {
   };
 }
 
-function getMappedCategory(category) {
-  const lowerCategory = category.toLowerCase(); // error is here this should be give the proper category classified category
-
-  console.log("mappppppppppppp", lowerCategory);
-
-  // Define a mapping of keywords to categories
-  const categoryMapping = {
-    wfh: [/wfh/, /work from home/, /working from home/],
-    full_leave: [
-      /full day leave/,
-      /full leave/,
-      /on leave/,
-      /leave today/,
-      /leave tomorrow/,
-      /taking leave/,
-      /on vacation/,
-      /on holiday/,
-    ],
-    half_leave: [
-      /half day leave/,
-      /half leave/,
-      /first half/,
-      /second half/,
-      /half day/,
-      /half-day/,
-    ],
-    come_late: [
-      /late to office/,
-      /come late/,
-      /running late/,
-      /will be late/,
-      /arriving late/,
-    ],
-    leave_early: [
-      /leaving early/,
-      /leave early/,
-      /will leave early/,
-      /going home early/,
-    ],
-  };
-
-  // Iterate through the mapping to find a match
-  for (const [key, regexes] of Object.entries(categoryMapping)) {
-    if (regexes.some((regex) => regex.test(lowerCategory))) {
-      return key; // Return the matched category
-    }
-  }
-
-  // If no match is found, log an error and default to "wfh"
-
-  logger.error(`Unknown categoryyyyyyyyy: ${category}`);
-  return "wfh"; // Default to WFH
-}
-
 // Function to store attendance data in Supabase
 async function storeAttendanceData(data) {
-  try {
-    // Map the category using the refactored logic
-    const mappedCategory = getMappedCategory(data.category);
-
-    // Prepare user data based on what we have
-    const userData = {
-      user_id: data.userId,
-      user_name: data.userName,
-      timestamp: new Date(parseInt(data.timestamp) * 1000).toISOString(),
-      message: data.message,
-      category: mappedCategory,
-      is_working_from_home: mappedCategory === "wfh", // Derived from category
-      is_leave_requested:
-        mappedCategory === "full_leave" || mappedCategory === "half_leave", // Derived from category
-      is_coming_late: mappedCategory === "come_late", // Derived from category
-      is_leave_early: mappedCategory === "leave_early", // Derived from category
-      first_name: data.firstName || null, // Ensure null if not provided
-      last_name: data.lastName || null, // Ensure null if not provided
-      email: data.email || null, // Ensure null if not provided
-    };
-
-    console.log("Inserting data into Supabase:", userData);
-
-    const { error } = await supabase.from("leave-table").insert([userData]);
-
-    if (error) {
-      console.error("Database error:", error);
-      throw error;
-    }
-
-    const timestampDate = new Date(parseInt(data.timestamp) * 1000);
-    const formattedDate = format(timestampDate, "dd-MMM-yyyy");
-
-    // Create detailed log entry
-    const logEntry = `${formattedDate} - ${userData.user_name} - ${userData.user_id} - ${mappedCategory} - "${userData.message}" - ${userData.is_working_from_home} - ${userData.is_leave_requested} - ${userData.is_coming_late} - ${userData.is_leave_early}`;
-
-    // Log the detailed information
-    logger.info(`Attendance record: ${logEntry}`);
-
-    console.log("Data successfully stored in database");
-  } catch (error) {
-    console.error("Error storing data:", error);
-    throw error;
+  console.log("dataaaaa", data);
+  // Map the category from OpenAI response to your enum values
+  let mappedCategory;
+  switch (data.category.toUpperCase()) {
+    case "WFH":
+      mappedCategory = "wfh";
+      break;
+    case "FULL DAY LEAVE":
+    case "FULL LEAVE":
+      mappedCategory = "full_leave";
+      break;
+    case "HALF DAY LEAVE":
+    case "HALF LEAVE":
+      mappedCategory = "half_leave";
+      break;
+    case "LEAVING EARLY":
+    case "LEAVE EARLY":
+      mappedCategory = "leave_early";
+      break;
+    case "LATE TO OFFICE":
+    case "COME LATE":
+      mappedCategory = "come_late";
+      break;
+    default:
+      mappedCategory = null;
   }
+
+  // Prepare user data based on what we have
+  const userData = {
+    user_id: data.userId,
+    user_name: data.userName,
+    timestamp: new Date(parseInt(data.timestamp) * 1000).toISOString(),
+    message: data.message,
+    category: mappedCategory,
+    is_working_from_home: data.isWorkingFromHome,
+    is_leave_requested: data.isLeaveRequest,
+    is_running_late: data.isRunningLate,
+  };
+
+  // Add first_name, last_name if available
+  if (data.firstName) userData.first_name = data.firstName;
+  if (data.lastName) userData.last_name = data.lastName;
+  if (data.email) userData.email = data.email;
+
+  console.log("Inserting data into Supabase:", userData);
+
+  const response = await supabase.from("leave-table").insert([userData]);
+
+  console.log("ressssssssss", response);
+
+  // if (error) {
+  //   console.error("Database error:", error);
+  //   throw error;
+  // }
+
+  console.log("Data successfully stored in database");
 }
 
-// Function to process natural language queries using Hugging Face API
+// Function to process natural language queries
 async function processQuery(query) {
-  try {
-    const response = await hf.textGeneration({
-      model: "mistralai/Mistral-7B-Instruct-v0.2", // Better instruction-following model
-      inputs: `<s>[INST] You are a helpful assistant that translates natural language queries about attendance data into JSON format for database queries.
-               
-The database has a table called 'leave_table' with columns: id, user_id, user_name, timestamp, message, category, is_working_from_home, is_leave_requested, is_running_late, first_name, last_name, email.
-
-Valid categories are: wfh, full_leave, half_leave, leave_early, come_late.
-
-Format your response as a JSON object with these properties:
-- queryType: 'count', 'list', 'trend', or 'summary'
-- category: the attendance category to filter by (if applicable)
-- timeFrame: 'day', 'week', 'month', 'quarter', or custom date range as {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD'}
-- groupBy: 'user', 'day', 'category' (if applicable)
-- limit: number of results to return (if applicable)
-- filters: additional filters for boolean fields like is_working_from_home, is_leave_requested, is_running_late (if applicable)
-
-Respond with ONLY valid JSON, no explanations or additional text.
-
-Query: ${query} [/INST]</s>`,
-      parameters: {
-        max_new_tokens: 500, // Increased to handle complex JSON responses
-        temperature: 0.1, // Lower temperature for more deterministic outputs
-        do_sample: false, // Don't use sampling for structured outputs
-        return_full_text: false, // Don't include the prompt in the output
+  // Use OpenAI to parse the query
+  const response = await openai.chat.completions.create({
+    model: "gpt-3.5-turbo",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a helpful assistant that categorizes attendance messages. " +
+          "Categorize the following message into exactly one of these categories: " +
+          "wfh, full_leave, half_leave, leave_early, come_late. " +
+          "Respond with only the category name, exactly as shown above.",
       },
-    });
+      {
+        role: "user",
+        content: message,
+      },
+    ],
+    temperature: 0.3,
+    max_tokens: 10,
+  });
 
-    // Clean the response to extract just the JSON
-    let jsonText = response.generated_text.trim();
-
-    // Look for the first { and last } to extract just the JSON part if there's any extra text
-    const startIdx = jsonText.indexOf("{");
-    const endIdx = jsonText.lastIndexOf("}");
-
-    if (startIdx >= 0 && endIdx >= 0) {
-      jsonText = jsonText.substring(startIdx, endIdx + 1);
-    }
-
-    // Parse the JSON
-    const queryParams = JSON.parse(jsonText);
-
-    // Log the structured query parameters
-    logger.info(
-      `Processed query into parameters: ${JSON.stringify(queryParams)}`
-    );
-
+  try {
+    const queryParams = JSON.parse(response.choices[0].message.content);
     return await executeQuery(queryParams);
   } catch (error) {
     logger.error("Error parsing query:", error);
