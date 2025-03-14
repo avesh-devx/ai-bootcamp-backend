@@ -2,17 +2,23 @@ const express = require("express");
 const app = express();
 const { App } = require("@slack/bolt");
 const dotenv = require("dotenv");
-// const { default: OpenAI } = require("openai");
 const logger = require("./src/libs/loggerConfig");
 const supabase = require("./src/libs/supabaseClient");
-const { HfInference } = require("@huggingface/inference");
+
+const { HuggingFaceInference } = require("@langchain/community/llms/hf");
+
 const { format } = require("date-fns");
+
+// Import LangChain components
+const { z } = require("zod");
+const { PromptTemplate } = require("@langchain/core/prompts");
+const { StructuredOutputParser } = require("langchain/output_parsers");
+const { RunnableSequence } = require("@langchain/core/runnables");
+const { ChatOpenAI } = require("@langchain/openai");
 
 dotenv.config();
 
 app.use(express.json());
-
-// console.log("keyyyyyyyy", process.env.OPENAI_API_KEY);
 
 // Initialize Slack app
 const slackApp = new App({
@@ -22,23 +28,157 @@ const slackApp = new App({
   appToken: process.env.SLACK_APP_TOKEN, // App-Level Token
 });
 
-// Initialize OpenAI
-// const openai = new OpenAI({
-//   apiKey: process.env.OPENAI_API_KEY,
-// });
+// Initialize LangChain models
+const openaiModel = new HuggingFaceInference({
+  model: "mistralai/Mistral-7B-Instruct-v0.2", // Your HF model
+  apiKey: process.env.HUGGING_FACE_API_KEY, // Your Hugging Face API Key
+  temperature: 0.1,
+});
 
-// Initialize Hugging Face Inference API
-const hf = new HfInference(process.env.HUGGING_FACE_API_KEY);
+// Define structured output schemas with Zod
+const categorySchema = z.object({
+  category: z.enum([
+    "WFH",
+    "WORK FROM HOME",
+    "FULL DAY LEAVE",
+    "HALF DAY LEAVE",
+    "LATE TO OFFICE",
+    "LEAVING EARLY",
+  ]),
+  confidence: z.number().min(0).max(1),
+});
 
-// ✅ message.channels → For messages in public channels.
-// ✅ message.groups → For messages in private channels (needed if you're using private channels).
-// ✅ message.im → For messages in DMs with the bot (if needed).
-// ✅ message.mpim → For group DMs (optional).
+// Zod for schema validation of AI outputs
+const detailsSchema = z.object({
+  isWorkingFromHome: z.boolean(),
+  isLeaveRequest: z.boolean(),
+  isRunningLate: z.boolean(),
+  isLeavingEarly: z.boolean(),
+  reason: z.string().nullable(),
+  startDate: z.string().nullable(),
+  endDate: z.string().nullable(),
+  additionalDetails: z.record(z.string(), z.any()).optional(),
+});
 
-// Attach Slack Bolt's built-in router to Express
-// console.log("loggggggg", slackApp.receiver.router);
-// app.use("/slack/events", slackApp.receiver.router);
+const queryParserSchema = z.object({
+  queryType: z.enum(["count", "list", "trend", "summary"]),
+  category: z.string().optional(),
+  timeFrame: z.union([
+    z.enum(["day", "week", "month", "quarter"]),
+    z.object({
+      start: z.string(),
+      end: z.string(),
+    }),
+  ]),
+  groupBy: z.enum(["user", "day", "category"]).optional(),
+  limit: z.number().optional(),
+  filters: z.record(z.string(), z.any()).optional(),
+});
 
+// Create parsers from schemas
+const categoryParser = StructuredOutputParser.fromZodSchema(categorySchema);
+const detailsParser = StructuredOutputParser.fromZodSchema(detailsSchema);
+const queryParser = StructuredOutputParser.fromZodSchema(queryParserSchema);
+
+// Create prompt templates
+const classificationPrompt = PromptTemplate.fromTemplate(
+  `You are a helpful assistant that categorizes attendance messages.
+  
+  Categorize the following message into exactly one of these categories:
+  1. WFH (Work From Home)
+  2. FULL DAY LEAVE
+  3. HALF DAY LEAVE
+  4. LATE TO OFFICE
+  5. LEAVING EARLY
+  
+  Message: {message}
+  
+  {format_instructions}`
+);
+
+const detailsPrompt = PromptTemplate.fromTemplate(
+  `Extract attendance details from the following message.
+  
+  Message: {message}
+  
+  Extract:
+  - If the person is working from home
+  - If this is a leave request (full or half day)
+  - If the person is running late
+  - If the person is leaving early
+  - The reason given (if any)
+  - Start date for leave/WFH (if specified)
+  - End date for leave/WFH (if specified)
+  - Any other relevant details
+  
+  {format_instructions}`
+);
+
+const queryPrompt = PromptTemplate.fromTemplate(
+  `You are a helpful assistant that translates natural language queries about attendance data into structured format.
+  
+  The database has a table called 'leave-table' with columns: 
+  id, user_id, user_name, timestamp, message, category, is_working_from_home, 
+  is_leave_requested, is_coming_late, is_leave_early, first_name, last_name, email.
+  
+  Valid categories are: wfh, full_leave, half_leave, leave_early, come_late.
+  
+  Query: {query}
+  
+  IMPORTANT: Your response must be a valid JSON object with ONLY the following structure:
+  {{
+    "queryType": "count", // or "list", "trend", "summary"
+    "category": "wfh", // optional, one of the valid categories
+    "timeFrame": "month", // or "day", "week", "quarter", or {{start: "2023-01-01", end: "2023-01-31"}}
+    "groupBy": "user", // optional, one of "user", "day", "category"
+    "limit": 10, // optional
+    "filters": {{}} // optional
+  }}
+  
+  Do not include any explanations or additional text. Respond ONLY with the valid JSON object.
+  
+  {format_instructions}`
+);
+
+// We've created three AI processing chains:
+
+// classificationChain: Categorizes messages into attendance types
+// detailsChain: Extracts detailed information from messages
+// queryChain: Translates natural language queries into structured database queries
+
+// Create the classification chain using the new approach
+const classificationChain = RunnableSequence.from([
+  {
+    message: (input) => input.message,
+    format_instructions: () => categoryParser.getFormatInstructions(),
+  },
+  classificationPrompt,
+  openaiModel,
+  categoryParser,
+]);
+
+const queryChain = RunnableSequence.from([
+  {
+    query: (input) => input.query,
+    format_instructions: () => queryParser.getFormatInstructions(),
+  },
+  queryPrompt,
+  openaiModel,
+  queryParser,
+]);
+
+// Create the details extraction chain
+const detailsChain = RunnableSequence.from([
+  {
+    message: (input) => input.message,
+    format_instructions: () => detailsParser.getFormatInstructions(),
+  },
+  detailsPrompt,
+  openaiModel,
+  detailsParser,
+]);
+
+// Slack event listenere
 // Listen for messages in channels the bot is added to
 slackApp.event("message", async ({ event, client }) => {
   try {
@@ -57,32 +197,17 @@ slackApp.event("message", async ({ event, client }) => {
       const lastName = userInfo.user.profile.last_name || "";
       const email = userInfo.user.profile.email || "";
 
-      // console.log("uuuuuuuu", userInfo);
-      // console.log("evvvvvvv", event.text);
+      //Classify message category
+      const classificationResult = await classificationChain.invoke({
+        message: event.text,
+      });
 
-      // Classify message
-      const { category, confidence } = await classifyMessage(event.text);
+      const { category, confidence } = classificationResult;
 
-      // Parse additional details from the message
-      const { isWorkingFromHome, isLeaveRequest, isRunningLate, reason } =
-        parseMessageDetails(event);
-
-      // Log the structured data
-      // const logData = {
-      //   user_name: userName,
-      //   timestamp: new Date(parseInt(event.ts) * 1000).toISOString(),
-      //   email: email,
-      //   user_id: event.user,
-      //   category: category,
-      //   reason: reason || "N/A",
-      //   is_working_from_home: isWorkingFromHome,
-      //   is_leave_requested: isLeaveRequest,
-      //   is_running_late: isRunningLate,
-      // };
-
-      // Log to console and file
-      // console.log("Attendance record:", JSON.stringify(logData));
-      // logger.info("Attendance record", logData);
+      //Get additional details: Parse additional details with LangChain
+      const detailsResult = await detailsChain.invoke({
+        message: event.text,
+      });
 
       // Store in database
       await storeAttendanceData({
@@ -96,10 +221,10 @@ slackApp.event("message", async ({ event, client }) => {
         category,
         confidence,
         channelId: event.channel,
-        isWorkingFromHome,
-        isLeaveRequest,
-        isRunningLate,
-        reason,
+        isWorkingFromHome: detailsResult.isWorkingFromHome,
+        isLeaveRequest: detailsResult.isLeaveRequest,
+        isRunningLate: detailsResult.isRunningLate,
+        isLeavingEarly: detailsResult.isLeavingEarly,
       });
     }
   } catch (error) {
@@ -111,8 +236,13 @@ slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   await ack();
 
   try {
-    // logger.info(`Received query: ${command.text}`);
-    const result = await processQuery(command.text);
+    // Process query with LangChain
+    const queryResult = await queryChain.invoke({
+      query: command.text,
+    });
+
+    // Execute the query
+    const result = await executeQuery(queryResult);
     await respond(result);
   } catch (error) {
     logger.error(`Error processing query: ${error}`);
@@ -120,197 +250,39 @@ slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   }
 });
 
-// Function to classify message using Hugging Face API
-async function classifyMessage(message) {
-  try {
-    // Use a more instruction-tuned model
-    const response = await hf.textGeneration({
-      model: "mistralai/Mistral-7B-Instruct-v0.2", // Better instruction-following model
-      inputs: `<s>[INST] You are a helpful assistant that categorizes attendance messages.
-Categorize the following message into exactly one of these categories:
-1. WFH (Work From Home)
-2. FULL DAY LEAVE
-3. HALF DAY LEAVE
-4. LATE TO OFFICE
-5. LEAVING EARLY
-Respond with ONLY the category name in uppercase, nothing else.
-
-Message: ${message} [/INST]</s>`,
-      parameters: {
-        max_new_tokens: 20, // Enough for the category name
-        temperature: 0.1, // Lower temperature for more deterministic outputs
-        do_sample: false, // Don't use sampling for classification
-        return_full_text: false, // Don't include the prompt in the output
-      },
-    });
-
-    // Clean the response to extract just the category
-    let category = response.generated_text.trim();
-
-    // Extract just the category if it contains other text
-    const categoryPatterns = [
-      /WFH|WORK FROM HOME/i,
-      /FULL DAY LEAVE/i,
-      /HALF DAY LEAVE/i,
-      /LATE TO OFFICE/i,
-      /LEAVING EARLY/i,
-    ];
-
-    for (const pattern of categoryPatterns) {
-      const match = category.match(pattern);
-      if (match) {
-        category = match[0].toUpperCase();
-        break;
-      }
-    }
-
-    console.log("Classified category:", category);
-    const confidence = 0.9; // Placeholder since HF doesn't provide confidence scores
-
-    return { category, confidence };
-  } catch (error) {
-    console.error(`Error classifying message with Hugging Face: ${error}`);
-    throw error;
-  }
-}
-
-// Function to parse additional details from the message
-function parseMessageDetails(event) {
-  const message = event.text.toLowerCase();
-
-  // Initialize return values
-  let isWorkingFromHome = false;
-  let isLeaveRequest = false;
-  let isRunningLate = false;
-  let reason = null;
-
-  // Check for WFH indicators
-  if (
-    message.includes("wfh") ||
-    message.includes("working from home") ||
-    message.includes("work from home")
-  ) {
-    isWorkingFromHome = true;
-  }
-
-  // Check for leave indicators
-  if (
-    message.includes("leave") ||
-    message.includes("off") ||
-    message.includes("vacation") ||
-    message.includes("holiday")
-  ) {
-    isLeaveRequest = true;
-  }
-
-  // Check for late indicators
-  if (
-    message.includes("late") ||
-    message.includes("delay") ||
-    message.includes("running behind") ||
-    message.includes("coming late")
-  ) {
-    isRunningLate = true;
-  }
-
-  // Extract reason - look for common patterns
-  // After "reason:", "because", "due to", etc.
-  let reasonMatch =
-    message.match(/reason\s*:?\s*(.+)/i) ||
-    message.match(/because\s*:?\s*(.+)/i) ||
-    message.match(/due to\s*:?\s*(.+)/i);
-
-  if (reasonMatch) {
-    reason = reasonMatch[1].trim();
-  }
-
-  return {
-    isWorkingFromHome,
-    isLeaveRequest,
-    isRunningLate,
-    reason,
-  };
-}
-
-function getMappedCategory(category) {
-  const lowerCategory = category.toLowerCase(); // error is here this should be give the proper category classified category
-
-  console.log("mappppppppppppp", lowerCategory);
-
-  // Define a mapping of keywords to categories
-  const categoryMapping = {
-    wfh: [/wfh/, /work from home/, /working from home/],
-    full_leave: [
-      /full day leave/,
-      /full leave/,
-      /on leave/,
-      /leave today/,
-      /leave tomorrow/,
-      /taking leave/,
-      /on vacation/,
-      /on holiday/,
-    ],
-    half_leave: [
-      /half day leave/,
-      /half leave/,
-      /first half/,
-      /second half/,
-      /half day/,
-      /half-day/,
-    ],
-    come_late: [
-      /late to office/,
-      /come late/,
-      /running late/,
-      /will be late/,
-      /arriving late/,
-    ],
-    leave_early: [
-      /leaving early/,
-      /leave early/,
-      /will leave early/,
-      /going home early/,
-    ],
-  };
-
-  // Iterate through the mapping to find a match
-  for (const [key, regexes] of Object.entries(categoryMapping)) {
-    if (regexes.some((regex) => regex.test(lowerCategory))) {
-      return key; // Return the matched category
-    }
-  }
-
-  // If no match is found, log an error and default to "wfh"
-
-  logger.error(`Unknown categoryyyyyyyyy: ${category}`);
-  return "wfh"; // Default to WFH
-}
-
-// Function to store attendance data in Supabase
 async function storeAttendanceData(data) {
   try {
-    // Map the category using the refactored logic
-    const mappedCategory = getMappedCategory(data.category);
+    // Map the category directly from LLM output
+    const mappedCategory = mapAttendanceCategory(data.category);
 
-    // Prepare user data based on what we have
+    // Extract date information
+    // const startDate = data.startDate
+    //   ? new Date(data.startDate).toISOString()
+    //   : null;
+    // const endDate = data.endDate ? new Date(data.endDate).toISOString() : null;
+
+    // Prepare user data
     const userData = {
       user_id: data.userId,
       user_name: data.userName,
       timestamp: new Date(parseInt(data.timestamp) * 1000).toISOString(),
       message: data.message,
       category: mappedCategory,
-      is_working_from_home: mappedCategory === "wfh", // Derived from category
-      is_leave_requested:
-        mappedCategory === "full_leave" || mappedCategory === "half_leave", // Derived from category
-      is_coming_late: mappedCategory === "come_late", // Derived from category
-      is_leave_early: mappedCategory === "leave_early", // Derived from category
-      first_name: data.firstName || null, // Ensure null if not provided
-      last_name: data.lastName || null, // Ensure null if not provided
-      email: data.email || null, // Ensure null if not provided
+      is_working_from_home: data.isWorkingFromHome,
+      is_leave_requested: data.isLeaveRequest,
+      is_coming_late: data.isRunningLate,
+      is_leave_early: data.isLeavingEarly,
+      first_name: data.firstName || null,
+      last_name: data.lastName || null,
+      email: data.email || null,
+      // start_date: startDate || null,
+      // end_date: endDate || null,
+      // additional_details: data.additionalDetails || null,
     };
 
     console.log("Inserting data into Supabase:", userData);
 
+    // Store in database
     const { error } = await supabase.from("leave-table").insert([userData]);
 
     if (error) {
@@ -322,7 +294,7 @@ async function storeAttendanceData(data) {
     const formattedDate = format(timestampDate, "dd-MMM-yyyy");
 
     // Create detailed log entry
-    const logEntry = `${formattedDate} - ${userData.user_name} - ${userData.user_id} - ${mappedCategory} - "${userData.message}" - ${userData.is_working_from_home} - ${userData.is_leave_requested} - ${userData.is_coming_late} - ${userData.is_leave_early}`;
+    const logEntry = `${formattedDate} - ${userData.user_name} - ${userData.category} - "${userData.message}"`;
 
     // Log the detailed information
     logger.info(`Attendance record: ${logEntry}`);
@@ -334,69 +306,37 @@ async function storeAttendanceData(data) {
   }
 }
 
-// Function to process natural language queries using Hugging Face API
-async function processQuery(query) {
-  try {
-    const response = await hf.textGeneration({
-      model: "mistralai/Mistral-7B-Instruct-v0.2", // Better instruction-following model
-      inputs: `<s>[INST] You are a helpful assistant that translates natural language queries about attendance data into JSON format for database queries.
-               
-The database has a table called 'leave_table' with columns: id, user_id, user_name, timestamp, message, category, is_working_from_home, is_leave_requested, is_running_late, first_name, last_name, email.
+function mapAttendanceCategory(category) {
+  const categoryMap = {
+    WFH: "wfh",
+    "WORK FROM HOME": "wfh",
+    "FULL DAY LEAVE": "full_leave",
+    "HALF DAY LEAVE": "half_leave",
+    "LATE TO OFFICE": "come_late",
+    "LEAVING EARLY": "leave_early",
+  };
 
-Valid categories are: wfh, full_leave, half_leave, leave_early, come_late.
-
-Format your response as a JSON object with these properties:
-- queryType: 'count', 'list', 'trend', or 'summary'
-- category: the attendance category to filter by (if applicable)
-- timeFrame: 'day', 'week', 'month', 'quarter', or custom date range as {start: 'YYYY-MM-DD', end: 'YYYY-MM-DD'}
-- groupBy: 'user', 'day', 'category' (if applicable)
-- limit: number of results to return (if applicable)
-- filters: additional filters for boolean fields like is_working_from_home, is_leave_requested, is_running_late (if applicable)
-
-Respond with ONLY valid JSON, no explanations or additional text.
-
-Query: ${query} [/INST]</s>`,
-      parameters: {
-        max_new_tokens: 500, // Increased to handle complex JSON responses
-        temperature: 0.1, // Lower temperature for more deterministic outputs
-        do_sample: false, // Don't use sampling for structured outputs
-        return_full_text: false, // Don't include the prompt in the output
-      },
-    });
-
-    // Clean the response to extract just the JSON
-    let jsonText = response.generated_text.trim();
-
-    // Look for the first { and last } to extract just the JSON part if there's any extra text
-    const startIdx = jsonText.indexOf("{");
-    const endIdx = jsonText.lastIndexOf("}");
-
-    if (startIdx >= 0 && endIdx >= 0) {
-      jsonText = jsonText.substring(startIdx, endIdx + 1);
-    }
-
-    // Parse the JSON
-    const queryParams = JSON.parse(jsonText);
-
-    // Log the structured query parameters
-    logger.info(
-      `Processed query into parameters: ${JSON.stringify(queryParams)}`
-    );
-
-    return await executeQuery(queryParams);
-  } catch (error) {
-    logger.error("Error parsing query:", error);
-    return "I couldn't understand that query. Please try again with a different wording.";
-  }
+  return categoryMap[category.toUpperCase()] || "wfh";
 }
 
 // Function to execute database queries based on parsed parameters
 async function executeQuery(params) {
   let query = supabase.from("leave-table").select("*");
 
+  console.log("queryyyyyyyy", query);
+
   // Add filters based on queryParams
   if (params.category) {
     query = query.eq("category", params.category);
+  }
+
+  // Add additional filters if present
+  if (params.filters) {
+    Object.entries(params.filters).forEach(([key, value]) => {
+      if (key in query) {
+        query = query.eq(key, value);
+      }
+    });
   }
 
   // Handle time frame
@@ -471,7 +411,7 @@ function calculateTimeRange(timeFrame) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-// Helper functions to format responses
+// Format response functions are kept the same
 function formatCountResponse(counts, params) {
   if (Object.keys(counts).length === 0) return "No matching records found.";
 
@@ -517,76 +457,110 @@ function formatListResponse(data, params) {
 }
 
 function formatTrendResponse(data, params) {
-  if (data.length === 0) return "No matching records found.";
+  if (data.length === 0) return "No data available for trend analysis.";
 
   const category = params.category || "attendance records";
   const timeFrame = formatTimeFrameText(params.timeFrame);
 
-  // Group by date
-  const dailyCounts = {};
+  // Group data by day
+  const dailyData = {};
   data.forEach((record) => {
-    const date = new Date(record.timestamp).toLocaleDateString();
-    dailyCounts[date] = (dailyCounts[date] || 0) + 1;
+    const day = new Date(record.timestamp).toISOString().split("T")[0];
+    dailyData[day] = (dailyData[day] || 0) + 1;
   });
+
+  // Sort days for display
+  const sortedDays = Object.keys(dailyData).sort();
+
+  // Find max count for scaling
+  const maxCount = Math.max(...Object.values(dailyData));
+  const scaleFactor = maxCount > 10 ? 10 / maxCount : 1;
 
   let response = `*${category.toUpperCase()} Trend for ${timeFrame}*\n\n`;
 
-  Object.entries(dailyCounts)
-    .sort((a, b) => new Date(a[0]) - new Date(b[0]))
-    .forEach(([date, count]) => {
-      const bars = "█".repeat(Math.min(Math.ceil(count / 2), 10));
-      response += `${date}: ${bars} (${count})\n`;
+  sortedDays.forEach((day) => {
+    const count = dailyData[day];
+    const bars = "█".repeat(Math.ceil(count * scaleFactor));
+    const formattedDay = new Date(day).toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
     });
+
+    response += `${formattedDay}: ${bars} (${count})\n`;
+  });
 
   return response;
 }
 
 function formatSummaryResponse(data, params) {
-  if (data.length === 0) return "No matching records found.";
+  if (data.length === 0) return "No data available for summary.";
 
   const timeFrame = formatTimeFrameText(params.timeFrame);
 
-  // Group by category
+  // Count by category
   const categoryCounts = {};
   data.forEach((record) => {
-    categoryCounts[record.category] =
-      (categoryCounts[record.category] || 0) + 1;
+    const category = record.category;
+    categoryCounts[category] = (categoryCounts[category] || 0) + 1;
   });
 
-  // Count unique users
-  const uniqueUsers = new Set(data.map((record) => record.user_id)).size;
+  // Count by user
+  const userCounts = {};
+  data.forEach((record) => {
+    const user = record.user_name;
+    userCounts[user] = (userCounts[user] || 0) + 1;
+  });
+
+  // Find top users
+  const topUsers = Object.entries(userCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
 
   let response = `*Attendance Summary for ${timeFrame}*\n\n`;
-  response += `Total Records: ${data.length}\n`;
-  response += `Unique Users: ${uniqueUsers}\n\n`;
-  response += `*Breakdown by Category:*\n`;
 
-  Object.entries(categoryCounts)
-    .sort((a, b) => b[1] - a[1])
-    .forEach(([category, count]) => {
-      const percentage = Math.round((count / data.length) * 100);
-      response += `${category}: ${count} (${percentage}%)\n`;
-    });
+  response += "*By Category:*\n";
+  for (const [category, count] of Object.entries(categoryCounts)) {
+    const prettyCategory =
+      {
+        wfh: "Work From Home",
+        full_leave: "Full Day Leave",
+        half_leave: "Half Day Leave",
+        come_late: "Late to Office",
+        leave_early: "Leaving Early",
+      }[category] || category;
+
+    response += `• ${prettyCategory}: ${count}\n`;
+  }
+
+  response += "\n*Top Users:*\n";
+  topUsers.forEach(([user, count], index) => {
+    response += `${index + 1}. ${user}: ${count} ${
+      count === 1 ? "record" : "records"
+    }\n`;
+  });
+
+  response += `\n*Total Records:* ${data.length}`;
 
   return response;
 }
 
 function formatTimeFrameText(timeFrame) {
   if (typeof timeFrame === "object" && timeFrame.start && timeFrame.end) {
-    return `${new Date(timeFrame.start).toLocaleDateString()} to ${new Date(
-      timeFrame.end
-    ).toLocaleDateString()}`;
+    const start = new Date(timeFrame.start).toLocaleDateString();
+    const end = new Date(timeFrame.end).toLocaleDateString();
+    return `${start} to ${end}`;
   }
 
   switch (timeFrame) {
     case "day":
       return "Today";
     case "week":
-      return "Past Week";
+      return "This Week";
     case "month":
-      return "Past Month";
+      return "This Month";
     case "quarter":
-      return "Past Quarter";
+      return "This Quarter";
     default:
       return "Selected Period";
   }
