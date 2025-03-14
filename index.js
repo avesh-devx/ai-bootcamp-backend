@@ -115,24 +115,33 @@ const detailsPrompt = PromptTemplate.fromTemplate(
 );
 
 const queryPrompt = PromptTemplate.fromTemplate(
-  `You are a helpful assistant that translates natural language queries about attendance data into structured format.
+  `You are a helpful assistant that translates natural language queries about attendance data into a structured JSON format that will be used to construct Supabase SQL queries.
   
-  The database has a table called 'leave-table' with columns: 
+  The database is in Supabase using PostgreSQL. It has a table called 'leave-table' with columns: 
   id, user_id, user_name, timestamp, message, category, is_working_from_home, 
   is_leave_requested, is_coming_late, is_leave_early, first_name, last_name, email.
   
   Valid categories are: wfh, full_leave, half_leave, leave_early, come_late.
+  
+  IMPORTANT: When a user asks about "leaves" or "leave" without specifying a category, use "all" as the category value to indicate all leave types should be included.
+  
+  When interpreting timeframes:
+  - "today" refers to the current date
+  - "this week" refers to the current calendar week
+  - "this month" refers to the current calendar month
+  - "this quarter" refers to the current calendar quarter
+  - Date ranges should be in ISO format (YYYY-MM-DD)
   
   Query: {query}
   
   IMPORTANT: Your response must be a valid JSON object with ONLY the following structure:
   {{
     "queryType": "count", // or "list", "trend", "summary"
-    "category": "wfh", // optional, one of the valid categories
+    "category": "all", // Use "all" for all leave types, or one of: wfh, full_leave, half_leave, leave_early, come_late
     "timeFrame": "month", // or "day", "week", "quarter", or {{start: "2023-01-01", end: "2023-01-31"}}
     "groupBy": "user", // optional, one of "user", "day", "category"
     "limit": 10, // optional
-    "filters": {{}} // optional
+    "filters": {{}} // optional, can include user_id, user_name, first_name, etc.
   }}
   
   Do not include any explanations or additional text. Respond ONLY with the valid JSON object.
@@ -319,58 +328,81 @@ function mapAttendanceCategory(category) {
   return categoryMap[category.toUpperCase()] || "wfh";
 }
 
-// Function to execute database queries based on parsed parameters
+// Modify the executeQuery function to better handle "all leaves" queries
 async function executeQuery(params) {
-  let query = supabase.from("leave-table").select("*");
+  try {
+    let query = supabase.from("leave-table").select("*");
 
-  console.log("queryyyyyyyy", query);
+    console.log("Query parameters:", params);
 
-  // Add filters based on queryParams
-  if (params.category) {
-    query = query.eq("category", params.category);
-  }
+    // Handle time frame
+    if (params.timeFrame) {
+      const { start, end } = calculateTimeRange(params.timeFrame);
+      query = query.gte("timestamp", start).lte("timestamp", end);
+    }
 
-  // Add additional filters if present
-  if (params.filters) {
-    Object.entries(params.filters).forEach(([key, value]) => {
-      if (key in query) {
-        query = query.eq(key, value);
-      }
-    });
-  }
-
-  // Handle time frame
-  if (params.timeFrame) {
-    const { start, end } = calculateTimeRange(params.timeFrame);
-    query = query.gte("timestamp", start).lte("timestamp", end);
-  }
-
-  // Execute query
-  const { data, error } = await query;
-
-  if (error) throw error;
-
-  // Format results based on query type
-  switch (params.queryType) {
-    case "count":
-      if (params.groupBy === "user") {
-        const userCounts = {};
-        data.forEach((record) => {
-          userCounts[record.user_name] =
-            (userCounts[record.user_name] || 0) + 1;
-        });
-        return formatCountResponse(userCounts, params);
+    // Handle category filtering
+    if (params.category) {
+      if (params.category === "all") {
+        // Don't add any category filter if "all" is specified
+        // This will return all records that match the other criteria
       } else {
-        return `Found ${data.length} records matching your query.`;
+        // Apply specific category filter
+        query = query.eq("category", params.category);
       }
-    case "list":
-      return formatListResponse(data, params);
-    case "trend":
-      return formatTrendResponse(data, params);
-    case "summary":
-      return formatSummaryResponse(data, params);
-    default:
-      return `Found ${data.length} records matching your query.`;
+    }
+
+    // Add additional filters if present
+    if (params.filters && Object.keys(params.filters).length > 0) {
+      Object.entries(params.filters).forEach(([key, value]) => {
+        if (key && value) {
+          query = query.eq(key, value);
+        }
+      });
+    }
+
+    // Apply limit if specified
+    if (params.limit) {
+      query = query.limit(params.limit);
+    }
+
+    console.log("Final query:", query);
+
+    // Execute query
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("Query execution error:", error);
+      throw error;
+    }
+
+    console.log(`Query returned ${data.length} records`);
+
+    // Format results based on query type
+    switch (params.queryType) {
+      case "count":
+        if (params.groupBy === "user") {
+          const userCounts = {};
+          data.forEach((record) => {
+            userCounts[record.user_name] =
+              (userCounts[record.user_name] || 0) + 1;
+          });
+          return formatCountResponse(userCounts, params);
+        } else {
+          return `Found ${data.length} records matching your query.`;
+        }
+      case "list":
+        return formatListResponse(data, params);
+      case "trend":
+        return formatTrendResponse(data, params);
+      case "summary":
+        return formatSummaryResponse(data, params);
+      default:
+        return `Found ${data.length} records matching your query.`;
+    }
+  } catch (error) {
+    console.error("Error in executeQuery:", error);
+    return `Sorry, I encountered an error processing your query: ${error.message}`;
   }
 }
 
