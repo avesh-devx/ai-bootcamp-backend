@@ -97,19 +97,33 @@ const classificationPrompt = PromptTemplate.fromTemplate(
 );
 
 const detailsPrompt = PromptTemplate.fromTemplate(
-  `Extract attendance details from the following message.
+  `Extract attendance details from the following message with EXTREME care for dates and durations.
+  
+  Today's date is ${format(new Date(), "yyyy-MM-dd")}.
   
   Message: {message}
   
+  IMPORTANT INSTRUCTIONS:
+  1. Pay special attention to date extraction
+  2. For "tomorrow", calculate the actual date (today + 1 day)
+  3. For "next week", calculate the date (today + 7 days)
+  4. When duration is mentioned (like "for three days" or "for a week"), calculate the end date
+  5. Always return dates in YYYY-MM-DD format
+  6. Never return NULL for dates when the message clearly mentions a time period
+  
+  For example:
+  - "I'll work from home tomorrow for three days" → startDate: [tomorrow's date], endDate: [tomorrow's date + 3 days]
+  - "Taking leave next week for 2 days" → startDate: [next week's date], endDate: [next week's date + 2 days]
+  
   Extract:
-  - If the person is working from home
-  - If this is a leave request (full or half day)
-  - If the person is running late
-  - If the person is leaving early
-  - The reason given (if any)
-  - Start date for leave/WFH (if specified)
-  - End date for leave/WFH (if specified)
-  - Any other relevant details
+  - If the person is working from home (isWorkingFromHome: true/false)
+  - If this is a leave request (isLeaveRequest: true/false)
+  - If the person is running late (isRunningLate: true/false)
+  - If the person is leaving early (isLeavingEarly: true/false)
+  - The reason given (reason: string or null)
+  - Start date (startDate: YYYY-MM-DD format, not null if mentioned)
+  - End date (endDate: YYYY-MM-DD format, calculated based on duration)
+  - Duration in days (durationDays: number)
   
   {format_instructions}`
 );
@@ -193,8 +207,6 @@ slackApp.event("message", async ({ event, client }) => {
   try {
     // Only process messages from actual users (not bots)
     if (event.subtype === undefined && event.bot_id === undefined) {
-      // logger.info(`Received message: ${event.text}`);
-
       // Get user info
       const userInfo = await client.users.info({
         user: event.user,
@@ -206,19 +218,21 @@ slackApp.event("message", async ({ event, client }) => {
       const lastName = userInfo.user.profile.last_name || "";
       const email = userInfo.user.profile.email || "";
 
-      //Classify message category
+      // Classify message category
       const classificationResult = await classificationChain.invoke({
         message: event.text,
       });
 
       const { category, confidence } = classificationResult;
 
-      //Get additional details: Parse additional details with LangChain
+      // Get additional details with improved prompt
       const detailsResult = await detailsChain.invoke({
         message: event.text,
       });
 
-      // Store in database
+      console.log("Extracted details:", detailsResult);
+
+      // Store in database with the complete detailsResult
       await storeAttendanceData({
         userId: event.user,
         userName: userName,
@@ -230,10 +244,7 @@ slackApp.event("message", async ({ event, client }) => {
         category,
         confidence,
         channelId: event.channel,
-        isWorkingFromHome: detailsResult.isWorkingFromHome,
-        isLeaveRequest: detailsResult.isLeaveRequest,
-        isRunningLate: detailsResult.isRunningLate,
-        isLeavingEarly: detailsResult.isLeavingEarly,
+        detailsResult: detailsResult, // Pass the entire object
       });
     }
   } catch (error) {
@@ -264,11 +275,22 @@ async function storeAttendanceData(data) {
     // Map the category directly from LLM output
     const mappedCategory = mapAttendanceCategory(data.category);
 
-    // Extract date information
-    // const startDate = data.startDate
-    //   ? new Date(data.startDate).toISOString()
-    //   : null;
-    // const endDate = data.endDate ? new Date(data.endDate).toISOString() : null;
+    // Ensure detailsResult values are accessed correctly
+    const {
+      startDate,
+      endDate,
+      isWorkingFromHome,
+      isLeaveRequest,
+      isRunningLate,
+      isLeavingEarly,
+    } = data.detailsResult;
+
+    // Log the extracted date information for debugging
+    console.log("Extracted date info:", {
+      startDate,
+      endDate,
+      message: data.message,
+    });
 
     // Prepare user data
     const userData = {
@@ -277,16 +299,15 @@ async function storeAttendanceData(data) {
       timestamp: new Date(parseInt(data.timestamp) * 1000).toISOString(),
       message: data.message,
       category: mappedCategory,
-      is_working_from_home: data.isWorkingFromHome,
-      is_leave_requested: data.isLeaveRequest,
-      is_coming_late: data.isRunningLate,
-      is_leave_early: data.isLeavingEarly,
+      is_working_from_home: isWorkingFromHome,
+      is_leave_requested: isLeaveRequest,
+      is_coming_late: isRunningLate,
+      is_leave_early: isLeavingEarly,
       first_name: data.firstName || null,
       last_name: data.lastName || null,
       email: data.email || null,
-      // start_date: startDate || null,
-      // end_date: endDate || null,
-      // additional_details: data.additionalDetails || null,
+      start_date: startDate,
+      end_date: endDate,
     };
 
     console.log("Inserting data into Supabase:", userData);
@@ -303,7 +324,10 @@ async function storeAttendanceData(data) {
     const formattedDate = format(timestampDate, "dd-MMM-yyyy");
 
     // Create detailed log entry
-    const logEntry = `${formattedDate} - ${userData.user_name} - ${userData.category} - "${userData.message}"`;
+    let logEntry = `${formattedDate} - ${userData.user_name} - ${userData.category} - "${userData.message}"`;
+    if (startDate) {
+      logEntry += ` (Start: ${startDate}${endDate ? `, End: ${endDate}` : ""})`;
+    }
 
     // Log the detailed information
     logger.info(`Attendance record: ${logEntry}`);
