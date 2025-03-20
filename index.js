@@ -102,6 +102,8 @@ const detailsPrompt = PromptTemplate.fromTemplate(
   Today's date is ${format(new Date(), "yyyy-MM-dd")}.
   
   ANALYZE THIS MESSAGE WITH EXTREME PRECISION: {message}
+
+  Start date should be extracted based on the user's timezone.
   
   CRITICAL ATTENDANCE TRACKING RULES:
   1. READ THE ENTIRE MESSAGE FIRST before extracting any information
@@ -182,7 +184,48 @@ const detailsPrompt = PromptTemplate.fromTemplate(
   ✓ startDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [tomorrow]
   ✓ durationDays: 1
   ✓ endDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [same as startDate]
-  
+
+  Rules and Guidelines:
+1. All times must be in IST.
+2. If the event falls on a Sunday, set 'is_valid' to false.
+3. For FDL requests:
+   - If sent before 9:00 AM or after 6:00 PM on weekdays, assume leave is for the next working day.
+   - If sent on Saturday after 1:00 PM or on Sunday, assume leave is for Monday (or next working day) unless explicitly mentioned otherwise.
+4. Time references:
+   - After 6:00 PM: Interpret as an event for the next working day.
+   - Before 9:00 AM: Assume the event is for the same day.
+   - Single time reference (e.g., "11"): Assume 11:00 AM.
+5. When time is not specified:
+   - No start time: Use current timestamp as start time.
+   - No end time: Assume 6:00 PM on weekdays or 1:00 PM on Saturday.
+   - No duration: Assume full-day leave.
+6. LTO (Late to Office):
+   - Start time: 9:00 AM
+   - End time: Specified arrival time
+   - Duration: Difference between start and end time
+7. LE (Leaving Early):
+   - Start time: Specified leaving time
+   - End time: 6:00 PM (weekdays) or 1:00 PM (Saturday)
+   - Duration: Difference between start and end time
+   - If between 1 PM and 2 PM on weekdays, categorize as HDL
+   - If at or after 6 PM (in context of today or time not specified), set 'is_valid' to false
+8. WFH:
+   - "WFH today" is not a leave request
+   - Specify duration if mentioned (e.g., "WFH till 11 AM" is 9:00 AM to 11:00 AM)
+9. Multiple events: Split into separate objects unless explicitly related
+10. Past leaves: If less than 6 months in the past, set 'is_valid' to false
+11. OOO requests after 6 PM or before 9 AM: Set 'is_valid' to false
+
+Analysis Process:
+1. Read the message carefully and quote relevant parts.
+2. Determine if the message is leave-related.
+3. If leave-related, extract and list relevant details (category, times, duration, reason).
+4. Consider possible categories and explain why you choose or reject each.
+5. Apply the rules and guidelines to categorize and validate the request, explaining your reasoning.
+6. Format the response according to the specified JSON structure.
+
+Please provide your analysis and response in the following format:
+
   REQUIRED ATTENDANCE FIELDS:
   - isWorkingFromHome: [true/false] - Is the employee working remotely?
   - isLeaveRequest: [true/false] - Is this a request for time off?
@@ -200,38 +243,106 @@ const detailsPrompt = PromptTemplate.fromTemplate(
 );
 
 const queryPrompt = PromptTemplate.fromTemplate(
-  `You are a helpful assistant that translates natural language queries about attendance data into a structured JSON format that will be used to construct Supabase SQL queries.
-  
-  The database is in Supabase using PostgreSQL. It has a table called 'leave-table' with columns: 
-  id, user_id, user_name, timestamp, message, category, is_working_from_home, 
-  is_leave_requested, is_coming_late, is_leave_early, first_name, last_name, email.
-  
-  Valid categories are: wfh, full_leave, half_leave, leave_early, come_late.
-  
-  IMPORTANT: When a user asks about "leaves" or "leave" without specifying a category, use "all" as the category value to indicate all leave types should be included.
-  
-  When interpreting timeframes:
-  - "today" refers to the current date
-  - "this week" refers to the current calendar week
-  - "this month" refers to the current calendar month
-  - "this quarter" refers to the current calendar quarter
-  - Date ranges should be in ISO format (YYYY-MM-DD)
-  
-  Query: {query}
-  
-  IMPORTANT: Your response must be a valid JSON object with ONLY the following structure:
+  `You are an expert assistant that converts natural language queries about attendance into precise Supabase query JSON. Follow these rules:
+
+  # Important: Always use the current year (2025) for all date operations unless a specific year is mentioned.
+
+# Database Schema
+Table: 'leave-table'
+Columns:
+- id, user_id, user_name, timestamp (record creation time)
+- start_date (timestamptz), end_date (timestamptz) - leave period in UTC
+- category: wfh, full_leave, half_leave, leave_early, come_late
+- Status flags: is_working_from_home, is_leave_requested, is_coming_late, is_leave_early
+- User details: first_name, last_name, email
+
+# Critical Time Handling (IST to UTC Conversion)
+- All dates in DB are UTC timestamptz
+- Date conversion rules:
+  1. User mentions "27 March" = 27 Mar 00:00-23:59 IST 
+  2. Convert to UTC:
+     - Start: 26 Mar 18:30 UTC
+     - End: 27 Mar 18:29:59 UTC
+  3. Create filter: 
+     start_date <= 27 Mar 18:29:59 UTC 
+     AND end_date >= 26 Mar 18:30 UTC
+
+# Query Analysis Guide
+1. Identify: 
+   - queryType (list/count/trend)
+   - Leave category (map terms:
+     - "leave" → full_leave
+     - "half day" → half_leave
+     - "WFH" → wfh
+     - "late" → come_late
+     - "early departure" → leave_early)
+2. Date ranges:
+   - Convert user dates to UTC ranges using above rules
+   - For multi-day leaves, check date overlap
+3. Filters:
+   - Use start_date/end_date for leave period filters
+   - Use timestamp for record creation time filters
+
+# Examples
+
+  Example 1: "Who took leave on March 27th?"
   {{
-    "queryType": "count", // or "list", "trend", "summary"
-    "category": "all", // Use "all" for all leave types, or one of: wfh, full_leave, half_leave, leave_early, come_late
-    "timeFrame": "month", // or "day", "week", "quarter", or {{start: "2023-01-01", end: "2023-01-31"}}
-    "groupBy": "user", // optional, one of "user", "day", "category"
-    "limit": 10, // optional
-    "filters": {{}} // optional, can include user_id, user_name, first_name, etc.
+    "queryType": "list",
+    "category": "all",
+    "timeFrame": {{"start": "2023-03-26T18:30:00Z", "end": "2023-03-27T18:29:59Z"}},
+    "filters": {{
+      "start_date": {{"lte": "2023-03-27T18:29:59Z"}},
+      "end_date": {{"gte": "2023-03-26T18:30:00Z"}}
+    }},
+    "groupBy": "user",
+    "limit": 50
   }}
-  
-  Do not include any explanations or additional text. Respond ONLY with the valid JSON object.
-  
-  {format_instructions}`
+
+Example 1: "Who took leave on March 27th?"
+{{
+  "queryType": "list",
+  "category": "all",
+  "timeFrame": {{"start": "2023-03-26T18:30:00Z", "end": "2023-03-27T18:29:59Z"}},
+  "filters": {{
+    "start_date": {{"lte": "2023-03-27T18:29:59Z"}},
+    "end_date": {{"gte": "2023-03-26T18:30:00Z"}}
+  }},
+  "groupBy": "user",
+  "limit": 50
+}}
+
+Example 2: "Late arrivals last month"
+{{
+  "queryType": "trend",
+  "category": "come_late",
+  "timeFrame": "month",
+  "filters": {{
+    "is_coming_late": true,
+    "start_date": {{"gte": "2023-02-01T18:30:00Z"}}
+  }},
+  "groupBy": "user"
+}}
+
+# Current Query
+Query: {query}
+
+Generate JSON response with EXACTLY this structure (ONLY JSON, NO TEXT BEFORE/AFTER):
+{{
+  "queryType": "count|list|trend|summary",
+  "category": "all|wfh|full_leave|half_leave|leave_early|come_late",
+  "timeFrame": "day|week|month|quarter|{{\"start\":\"ISO_DATE\",\"end\":\"ISO_DATE\"}}",
+  "groupBy": "user_id|user_name|day|category",
+  "limit": 10,
+  "filters": {{
+    "start_date": {{\"gte?\": \"ISO_DATE\", \"lte?\": \"ISO_DATE\"}},
+    "end_date": {{\"gte?\": \"ISO_DATE\", \"lte?\": \"ISO_DATE\"}},
+    "user_id?": "value",
+    "user_name?": "value"
+  }}
+}}
+
+ONLY respond with valid JSON. No code blocks, no explanations, no markdown formatting.
+`
 );
 
 // We've created three AI processing chains:
@@ -322,22 +433,92 @@ slackApp.event("message", async ({ event, client }) => {
     logger.error(`Error processing message: ${error}`);
   }
 });
+
+function formatResponse(data) {
+  return data
+    .map((record) => {
+      const startDate = new Date(record.start_date).toLocaleDateString(
+        "en-IN",
+        {
+          timeZone: "Asia/Kolkata",
+          day: "numeric",
+          month: "short",
+          year: "numeric",
+        }
+      );
+
+      const endDate = new Date(record.end_date).toLocaleDateString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        day: "numeric",
+        month: "short",
+        year: "numeric",
+      });
+
+      return `👤 *${
+        record.user_name || record.first_name + " " + record.last_name
+      }*
+📅 Dates: ${startDate} - ${endDate}
+🏷️ Type: ${formatCategory(record.category)}
+📝 ${record.message || "No message provided"}`;
+    })
+    .join("\n\n");
+}
+
+function formatCategory(category) {
+  const categoryMap = {
+    wfh: "Work From Home",
+    full_leave: "Full Day Leave",
+    half_leave: "Half Day Leave",
+    leave_early: "Leave Early",
+    come_late: "Coming Late",
+  };
+  return categoryMap[category] || category;
+}
 // Slack slash command for queries
 slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   await ack();
 
   try {
-    // Process query with LangChain
-    const queryResult = await queryChain.invoke({
-      query: command.text,
-    });
+    const queryResult = await queryChain.invoke({ query: command.text });
+    console.log("queryresulttttt", queryResult);
 
-    // Execute the query
-    const result = await executeQuery(queryResult);
-    await respond(result);
+    // Use proper column names from your schema
+    const queryParams = {
+      queryType: queryResult.queryType || "list",
+      category: queryResult.category || "all",
+      timeFrame: queryResult.timeFrame || "day",
+      groupBy: queryResult.groupBy || "user",
+      limit: queryResult.limit || 10,
+      filters: {
+        // Use the actual start_date and end_date filters from LLM output
+        start_date: queryResult.filters?.start_date || {},
+        end_date: queryResult.filters?.end_date || {},
+        // Include timestamp only if needed for record creation time
+        timestamp: {
+          gte: queryResult.timeFrame?.start,
+          lte: queryResult.timeFrame?.end,
+        },
+      },
+    };
+
+    console.log("Final query parameters:", queryParams);
+
+    const { data, error } = await supabase
+      .from("leave-table")
+      .select("*")
+      // Use start_date and end_date for leave period filtering
+      .lte("start_date", queryParams.filters.timestamp.lte) // Leave starts on or before end of range
+      .gte("end_date", queryParams.filters.timestamp.gte) // Leave ends on or after start of range
+      .limit(queryParams.limit);
+
+    if (error) throw error;
+
+    await respond(
+      data.length > 0 ? formatResponse(data) : "No matching records found"
+    );
   } catch (error) {
-    logger.error(`Error processing query: ${error}`);
-    await respond("Sorry, I couldn't process that query. Please try again.");
+    console.error("Query execution error:", error);
+    await respond(`⚠️ Error: ${error.message.split("\n")[0]}`);
   }
 });
 
@@ -430,27 +611,25 @@ async function executeQuery(params) {
 
     console.log("Query parameters:", params);
 
-    // Handle time frame
-    if (params.timeFrame) {
-      const { start, end } = calculateTimeRange(params.timeFrame);
-      query = query.gte("timestamp", start).lte("timestamp", end);
+    // ✅ Use the correct timestamps from params.filters.timestamp
+    if (params.filters?.timestamp) {
+      const { gte, lte } = params.filters.timestamp;
+      if (gte && lte) {
+        query = query.gte("timestamp", gte).lte("timestamp", lte);
+      }
     }
 
     // Handle category filtering
     if (params.category) {
-      if (params.category === "all") {
-        // Don't add any category filter if "all" is specified
-        // This will return all records that match the other criteria
-      } else {
-        // Apply specific category filter
+      if (params.category !== "all") {
         query = query.eq("category", params.category);
       }
     }
 
     // Add additional filters if present
-    if (params.filters && Object.keys(params.filters).length > 0) {
+    if (params.filters) {
       Object.entries(params.filters).forEach(([key, value]) => {
-        if (key && value) {
+        if (key !== "timestamp" && value) {
           query = query.eq(key, value);
         }
       });
