@@ -7,14 +7,13 @@ const supabase = require("./src/libs/supabaseClient");
 
 const { HuggingFaceInference } = require("@langchain/community/llms/hf");
 
-const { format } = require("date-fns");
+const { format, addDays } = require("date-fns");
 
 // Import LangChain components
 const { z } = require("zod");
 const { PromptTemplate } = require("@langchain/core/prompts");
 const { StructuredOutputParser } = require("langchain/output_parsers");
 const { RunnableSequence } = require("@langchain/core/runnables");
-const { ChatOpenAI } = require("@langchain/openai");
 
 dotenv.config();
 
@@ -57,6 +56,7 @@ const detailsSchema = z.object({
   reason: z.string().nullable(),
   startDate: z.string().nullable(),
   endDate: z.string().nullable(),
+  durationDays: z.number().nullable(), // Explicitly capture duration in days
   additionalDetails: z.record(z.string(), z.any()).optional(),
 });
 
@@ -97,33 +97,104 @@ const classificationPrompt = PromptTemplate.fromTemplate(
 );
 
 const detailsPrompt = PromptTemplate.fromTemplate(
-  `Extract attendance details from the following message with EXTREME care for dates and durations.
-  
+  `You are the Chief Attendance Manager at a Fortune 500 global enterprise with strict compliance requirements. Your critical responsibility is to accurately track EVERY detail of employee attendance with 100% precision. Millions of dollars in payroll and regulatory compliance depend on your accurate interpretation of employee messages.
+
   Today's date is ${format(new Date(), "yyyy-MM-dd")}.
   
-  Message: {message}
+  ANALYZE THIS MESSAGE WITH EXTREME PRECISION: {message}
   
-  IMPORTANT INSTRUCTIONS:
-  1. Pay special attention to date extraction
-  2. For "tomorrow", calculate the actual date (today + 1 day)
-  3. For "next week", calculate the date (today + 7 days)
-  4. When duration is mentioned (like "for three days" or "for a week"), calculate the end date
-  5. Always return dates in YYYY-MM-DD format
-  6. Never return NULL for dates when the message clearly mentions a time period
+  CRITICAL ATTENDANCE TRACKING RULES:
+  1. READ THE ENTIRE MESSAGE FIRST before extracting any information
+  2. Your PRIMARY DUTY is to determine EXACTLY when an employee will be absent/present and for how long
+  3. The company has a ZERO-TOLERANCE policy for attendance tracking errors
+  4. Dates must be EXACT to the day - no approximations allowed
+  5. Duration must be accurately calculated in days
   
-  For example:
-  - "I'll work from home tomorrow for three days" → startDate: [tomorrow's date], endDate: [tomorrow's date + 3 days]
-  - "Taking leave next week for 2 days" → startDate: [next week's date], endDate: [next week's date + 2 days]
+  TIME UNIT CONVERSION CHART:
+  - 1 hour = 0.125 days (for partial day calculations)
+  - 1 day = 1 day
+  - 1 week = 7 days
+  - 1 month = 30 days (standard company policy)
+  - 1 quarter = 90 days
+  - 1 year = 365 days
+  - 1 decade = 3650 days
   
-  Extract:
-  - If the person is working from home (isWorkingFromHome: true/false)
-  - If this is a leave request (isLeaveRequest: true/false)
-  - If the person is running late (isRunningLate: true/false)
-  - If the person is leaving early (isLeavingEarly: true/false)
-  - The reason given (reason: string or null)
-  - Start date (startDate: YYYY-MM-DD format, not null if mentioned)
-  - End date (endDate: YYYY-MM-DD format, calculated based on duration)
-  - Duration in days (durationDays: number)
+  DATE REFERENCE POINTS:
+  - "today" = ${format(new Date(), "yyyy-MM-dd")}
+  - "tomorrow" = ${format(addDays(new Date(), 1), "yyyy-MM-dd")}
+  - "next week" = ${format(
+    addDays(new Date(), 7),
+    "yyyy-MM-dd"
+  )} (starting date)
+  - "next month" = starting on the 1st of next month
+  - "next quarter" = starting on the 1st of next quarter
+  
+  DURATION CALCULATION PROTOCOL:
+  1. ALWAYS calculate endDate = startDate + (durationDays - 1)
+  2. For "X days" → durationDays = X
+  3. For "X weeks" → durationDays = X * 7
+  4. For "X months" → durationDays = X * 30
+  5. For "X years" → durationDays = X * 365
+  6. For "X hours" → durationDays = 1 (same day)
+  
+  ATTENDANCE SCENARIOS AND REQUIRED OUTPUTS:
+  
+  SCENARIO 1: MULTI-DAY WORK FROM HOME
+  Example: "I'll work from home for four days from tomorrow"
+  ✓ isWorkingFromHome: true
+  ✓ isLeaveRequest: false
+  ✓ startDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [tomorrow]
+  ✓ durationDays: 4
+  ✓ endDate: ${format(
+    addDays(new Date(), 4),
+    "yyyy-MM-dd"
+  )} [startDate + (durationDays - 1)]
+  
+  SCENARIO 2: SINGLE DAY LEAVE
+  Example: "Taking half day leave tomorrow"
+  ✓ isWorkingFromHome: false
+  ✓ isLeaveRequest: true
+  ✓ startDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [tomorrow]
+  ✓ durationDays: 1
+  ✓ endDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [same as startDate]
+  
+  SCENARIO 3: LEAVE WITH SPECIFIC DATES
+  Example: "I'll be on leave from March 25 to March 30"
+  ✓ isWorkingFromHome: false
+  ✓ isLeaveRequest: true
+  ✓ startDate: 2025-03-25
+  ✓ endDate: 2025-03-30
+  ✓ durationDays: 6 [calculated from date range]
+  
+  SCENARIO 4: LEAVE WITH DURATION IN WEEKS
+  Example: "Taking leave for 2 weeks starting next Monday"
+  ✓ isWorkingFromHome: false
+  ✓ isLeaveRequest: true
+  ✓ startDate: [next Monday's date]
+  ✓ durationDays: 14
+  ✓ endDate: [startDate + 13 days]
+  
+  SCENARIO 5: HOURS-BASED TIMING
+  Example: "Coming in 2 hours late tomorrow"
+  ✓ isWorkingFromHome: false
+  ✓ isLeaveRequest: false
+  ✓ isRunningLate: true
+  ✓ startDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [tomorrow]
+  ✓ durationDays: 1
+  ✓ endDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [same as startDate]
+  
+  REQUIRED ATTENDANCE FIELDS:
+  - isWorkingFromHome: [true/false] - Is the employee working remotely?
+  - isLeaveRequest: [true/false] - Is this a request for time off?
+  - isRunningLate: [true/false] - Will the employee arrive late?
+  - isLeavingEarly: [true/false] - Will the employee depart early?
+  - reason: [string or null] - Stated reason for absence/WFH
+  - startDate: [YYYY-MM-DD] - MUST NEVER BE NULL
+  - durationDays: [number] - MUST NEVER BE NULL, minimum 1 for any request
+  - endDate: [YYYY-MM-DD] - MUST NEVER BE NULL, calculated as startDate + (durationDays - 1)
+  
+  CRITICAL HR COMPLIANCE REQUIREMENT:
+  If the end date would be after the start date, or if the message mentions a duration (e.g., "for X days"), you MUST calculate and provide the correct end date. Failure to do so would violate company policy and could result in payroll errors.
   
   {format_instructions}`
 );
