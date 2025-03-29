@@ -49,7 +49,7 @@ export function mapAttendanceCategory(category) {
     "LEAVING EARLY": "leave_early",
   };
 
-  return categoryMap[category.toUpperCase()] || "wfh";
+  return categoryMap[category.toUpperCase()] || "unknown";
 }
 
 export function calculateTimeRange(timeFrame) {
