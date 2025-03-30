@@ -242,6 +242,23 @@ const detailsPrompt = PromptTemplate.fromTemplate(
   ✓ durationDays: 1
   ✓ endDate: 2025-04-25
 
+  SCENARIO 4: DAYS AFTER A SPECIFIC DATE
+  Example: "I'm not available for 3 days after the 15th of the next month"
+  ✓ isWorkingFromHome: false
+  ✓ isLeaveRequest: true
+  ✓ startDate: 2025-04-16 (assuming current month is March - this is the day AFTER the 15th)
+  ✓ durationDays: 3
+  ✓ endDate: 2025-04-18
+
+  SCENARIO 5: HOURS-BASED TIMING
+  Example: "Coming in 2 hours late tomorrow"
+  ✓ isWorkingFromHome: false
+  ✓ isLeaveRequest: false
+  ✓ isRunningLate: true
+  ✓ startDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [tomorrow]
+  ✓ durationDays: 1
+  ✓ endDate: ${format(addDays(new Date(), 1), "yyyy-MM-dd")} [same as startDate]
+
 Provide ONLY a valid JSON response, without any extra explanation or analysis. STRICTLY follow this format:
 
   REQUIRED ATTENDANCE FIELDS:
@@ -259,6 +276,7 @@ Provide ONLY a valid JSON response, without any extra explanation or analysis. S
   2. For any single day absence (including half-day or partial availability), set durationDays = 1 and endDate = startDate.
   3. For multi-day absences, calculate endDate = startDate + (durationDays - 1).
   4. For date expressions like "the 25th of the next month", extract the specific day mentioned (25th), not just the general period (next month).
+  5. If the end date would be after the start date, or if the message mentions a duration (e.g., "for X days"), you MUST calculate and provide the correct end date. Failure to do so would violate company policy and could result in payroll errors.
   
   {format_instructions}`
 );
