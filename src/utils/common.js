@@ -1,4 +1,4 @@
-export function formatResponse(data) {
+function formatResponse(data) {
   return data
     .map((record) => {
       const startDate = new Date(record.start_date).toLocaleDateString(
@@ -28,7 +28,7 @@ export function formatResponse(data) {
     .join("\n\n");
 }
 
-export function formatCategory(category) {
+function formatCategory(category) {
   const categoryMap = {
     wfh: "Work From Home",
     full_leave: "Full Day Leave",
@@ -39,7 +39,7 @@ export function formatCategory(category) {
   return categoryMap[category] || category;
 }
 
-export function mapAttendanceCategory(category) {
+function mapAttendanceCategory(category) {
   const categoryMap = {
     WFH: "wfh",
     "WORK FROM HOME": "wfh",
@@ -52,7 +52,7 @@ export function mapAttendanceCategory(category) {
   return categoryMap[category.toUpperCase()] || "unknown";
 }
 
-export function calculateTimeRange(timeFrame) {
+function calculateTimeRange(timeFrame) {
   const now = new Date();
   let start,
     end = new Date();
@@ -88,7 +88,7 @@ export function calculateTimeRange(timeFrame) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-export function formatCountResponse(counts, params) {
+function formatCountResponse(counts, params) {
   if (Object.keys(counts).length === 0) return "No matching records found.";
 
   const category = params.category || "attendance records";
@@ -109,7 +109,7 @@ export function formatCountResponse(counts, params) {
   return response;
 }
 
-export function formatListResponse(data, params) {
+function formatListResponse(data, params) {
   if (data.length === 0) return "No matching records found.";
 
   const category = params.category || "attendance records";
@@ -132,7 +132,7 @@ export function formatListResponse(data, params) {
   return response;
 }
 
-export function formatTrendResponse(data, params) {
+function formatTrendResponse(data, params) {
   if (data.length === 0) return "No data available for trend analysis.";
 
   const category = params.category || "attendance records";
@@ -169,7 +169,7 @@ export function formatTrendResponse(data, params) {
   return response;
 }
 
-export function formatSummaryResponse(data, params) {
+function formatSummaryResponse(data, params) {
   if (data.length === 0) return "No data available for summary.";
 
   const timeFrame = formatTimeFrameText(params.timeFrame);
@@ -221,7 +221,7 @@ export function formatSummaryResponse(data, params) {
   return response;
 }
 
-export function formatTimeFrameText(timeFrame) {
+function formatTimeFrameText(timeFrame) {
   if (typeof timeFrame === "object" && timeFrame.start && timeFrame.end) {
     const start = new Date(timeFrame.start).toLocaleDateString();
     const end = new Date(timeFrame.end).toLocaleDateString();
@@ -241,3 +241,168 @@ export function formatTimeFrameText(timeFrame) {
       return "Selected Period";
   }
 }
+
+async function storeAttendanceData(data) {
+  try {
+    // Map the category directly from LLM output
+    const mappedCategory = mapAttendanceCategory(data.category);
+
+    // Ensure detailsResult values are accessed correctly
+    const {
+      startDate,
+      endDate,
+      isWorkingFromHome,
+      isLeaveRequest,
+      isRunningLate,
+      isLeavingEarly,
+    } = data.detailsResult;
+
+    // Log the extracted date information for debugging
+    console.log("Extracted date info:", {
+      startDate,
+      endDate,
+      message: data.message,
+    });
+
+    // Prepare user data
+    const userData = {
+      user_id: data.userId,
+      user_name: data.userName,
+      timestamp: new Date(parseInt(data.timestamp) * 1000).toISOString(),
+      message: data.message,
+      category: mappedCategory,
+      is_working_from_home: isWorkingFromHome,
+      is_leave_requested: isLeaveRequest,
+      is_coming_late: isRunningLate,
+      is_leave_early: isLeavingEarly,
+      first_name: data.firstName || null,
+      last_name: data.lastName || null,
+      email: data.email || null,
+      start_date: startDate,
+      end_date: endDate,
+    };
+
+    console.log("Inserting data into Supabase:", userData);
+
+    // Store in database
+    const { error } = await supabase.from("leave-table").insert([userData]);
+
+    if (error) {
+      console.error("Database error:", error);
+      throw error;
+    }
+
+    const timestampDate = new Date(parseInt(data.timestamp) * 1000);
+    const formattedDate = format(timestampDate, "dd-MMM-yyyy");
+
+    // Create detailed log entry
+    let logEntry = `${formattedDate} - ${userData.user_name} - ${userData.category} - "${userData.message}"`;
+    if (startDate) {
+      logEntry += ` (Start: ${startDate}${endDate ? `, End: ${endDate}` : ""})`;
+    }
+
+    // Log the detailed information
+    logger.info(`Attendance record: ${logEntry}`);
+
+    console.log("Data successfully stored in database");
+  } catch (error) {
+    console.error("Error storing data:", error);
+    throw error;
+  }
+}
+
+// Modify the executeQuery function to better handle "all leaves" queries
+async function executeQuery(params) {
+  try {
+    let query = supabase.from("leave-table").select("*");
+
+    console.log("Query parameters:", params);
+
+    // ✅ Use the correct timestamps from params.filters.timestamp
+    if (params.filters?.start_date || params.filters?.end_date) {
+      if (params.filters.start_date?.lte) {
+        query = query.lte("start_date", params.filters.start_date.lte);
+      }
+      if (params.filters.end_date?.gte) {
+        query = query.gte("end_date", params.filters.end_date.gte);
+      }
+    }
+
+    // Handle category filtering
+    if (params.category) {
+      if (params.category !== "all") {
+        query = query.eq("category", params.category);
+      }
+    }
+
+    // Add additional filters if present
+    if (params.filters) {
+      Object.entries(params.filters).forEach(([key, value]) => {
+        if (key !== "timestamp" && value) {
+          query = query.eq(key, value);
+        }
+      });
+    }
+
+    // Apply limit if specified
+    if (params.limit) {
+      query = query.limit(params.limit);
+    }
+
+    console.log("Final query:", query);
+
+    // Execute query
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("Query execution error:", error);
+      throw error;
+    }
+
+    console.log(`Query returned ${data.length} records`);
+
+    // Format results based on query type
+    switch (params.queryType) {
+      case "count":
+        if (params.groupBy === "user") {
+          const userCounts = {};
+          data.forEach((record) => {
+            userCounts[record.user_name] =
+              (userCounts[record.user_name] || 0) + 1;
+          });
+          return formatCountResponse(userCounts, params);
+        } else {
+          return `Found ${data.length} records matching your query.`;
+        }
+      case "list":
+        return formatListResponse(data, params);
+      case "trend":
+        return formatTrendResponse(data, params);
+      case "summary":
+        return formatSummaryResponse(data, params);
+      default:
+        return `Found ${data.length} records matching your query.`;
+    }
+  } catch (error) {
+    console.error("Error in executeQuery:", error);
+    return `Sorry, I encountered an error processing your query: ${error.message}`;
+  }
+}
+
+module.exports = {
+  executeQuery,
+  storeAttendanceData,
+  formatCountResponse,
+  formatListResponse,
+  formatTrendResponse,
+  formatSummaryResponse,
+  formatTimeFrameText,
+  mapAttendanceCategory,
+  formatTimeFrameText,
+  formatCountResponse,
+  formatListResponse,
+  formatTrendResponse,
+  formatSummaryResponse,
+  formatTimeFrameText,
+  mapAttendanceCategory,
+};

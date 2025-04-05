@@ -10,22 +10,31 @@ const { HuggingFaceInference } = require("@langchain/community/llms/hf");
 const { format, addDays } = require("date-fns");
 
 // Import LangChain components
-const { z } = require("zod");
 const { PromptTemplate } = require("@langchain/core/prompts");
 const { StructuredOutputParser } = require("langchain/output_parsers");
 const { RunnableSequence } = require("@langchain/core/runnables");
+const { formatResponse, mapAttendanceCategory } = require("./src/utils/common");
 const {
-  formatResponse,
-  mapAttendanceCategory,
-  formatCountResponse,
-  formatListResponse,
-  formatTrendResponse,
-  formatSummaryResponse,
-} = require("./src/utils/common");
+  categorySchema,
+  detailsSchema,
+  queryParserSchema,
+} = require("./src/utils/schema");
+const { createDynamicDetailsPrompt } = require("./src/utils/dynamicPrompts");
+const { vectorStore } = require("./src/libs/vectorStore");
 
 dotenv.config();
 
 app.use(express.json());
+
+// Function to store examples
+async function storeExample(message, parsedResult) {
+  const combinedText = `Message: ${message}\nParsed Result: ${JSON.stringify(
+    parsedResult
+  )}`;
+  await vectorStore.addDocuments([
+    { pageContent: combinedText, metadata: { success: true } },
+  ]);
+}
 
 // Initialize Slack app
 const slackApp = new App({
@@ -33,6 +42,38 @@ const slackApp = new App({
   signingSecret: process.env.SLACK_SIGNING_SECRET, // Signing Secret
   socketMode: true, // Enable Socket Mode
   appToken: process.env.SLACK_APP_TOKEN, // App-Level Token
+  customRoutes: [],
+  socketModeOptions: {
+    reconnect: true, // Enable auto-reconnect
+    maxReconnectionAttempts: 10, // Limit number of reconnection attempts
+    reconnectionBackoff: 5000, // Start with 5 second delay between attempts
+    reconnectionBackoffMax: 60000, // Maximum 1 minute between attempts
+  },
+});
+
+//Events
+slackApp.error((error) => {
+  logger.error(`Slack app error: ${error.message}`);
+});
+
+// Add connection event listeners
+let isConnected = false;
+slackApp.client.on("connecting", () => {
+  logger.info("Connecting to Slack...");
+});
+
+slackApp.client.on("connected", () => {
+  isConnected = true;
+  logger.info("Successfully connected to Slack");
+});
+
+slackApp.client.on("disconnected", () => {
+  isConnected = false;
+  logger.warn("Disconnected from Slack, attempting to reconnect...");
+});
+
+slackApp.client.on("reconnecting", () => {
+  logger.info("Attempting to reconnect to Slack...");
 });
 
 // Initialize LangChain models
@@ -47,47 +88,6 @@ const aiModel = new HuggingFaceInference({
 //   apiKey: process.env.HUGGING_FACE_API_KEY, // Your Hugging Face API Key
 //   temperature: 0.1,
 // });
-
-// Define structured output schemas with Zod
-const categorySchema = z.object({
-  category: z.enum([
-    "WFH",
-    "WORK FROM HOME",
-    "FULL DAY LEAVE",
-    "HALF DAY LEAVE",
-    "LATE TO OFFICE",
-    "LEAVING EARLY",
-  ]),
-  confidence: z.number().min(0).max(1),
-});
-
-// Zod for schema validation of AI outputs
-const detailsSchema = z.object({
-  isWorkingFromHome: z.boolean(),
-  isLeaveRequest: z.boolean(),
-  isRunningLate: z.boolean(),
-  isLeavingEarly: z.boolean(),
-  reason: z.string().nullable(),
-  startDate: z.string().nullable(),
-  endDate: z.string().nullable(),
-  durationDays: z.number().nullable(), // Explicitly capture duration in days
-  additionalDetails: z.record(z.string(), z.any()).optional(),
-});
-
-const queryParserSchema = z.object({
-  queryType: z.enum(["count", "list", "trend", "summary"]),
-  category: z.string().optional(),
-  timeFrame: z.union([
-    z.enum(["day", "week", "month", "quarter"]),
-    z.object({
-      start: z.string(),
-      end: z.string(),
-    }),
-  ]),
-  groupBy: z.enum(["user", "day", "category"]).nullable(),
-  limit: z.number().optional(),
-  filters: z.record(z.string(), z.any()).optional(),
-});
 
 // Create parsers from schemas
 const categoryParser = StructuredOutputParser.fromZodSchema(categorySchema);
@@ -581,7 +581,9 @@ slackApp.event("message", async ({ event, client }) => {
   try {
     // Process regular messages
     if (event.subtype === undefined && event.bot_id === undefined) {
+      console.log("11111111");
       await processAttendanceMessage(event, client);
+      console.log("22222222");
     }
     // Process edited messages
     else if (
@@ -604,9 +606,120 @@ slackApp.event("message", async ({ event, client }) => {
   }
 });
 
-// Separate function to process attendance messages (new or edited)
+async function fetchExamplesFromDatabase() {
+  try {
+    const { data, error } = await supabase
+      .from("leave-examples")
+      .select("message, parsed_result")
+      .eq("success", true)
+      .limit(100);
+
+    if (error) throw error;
+
+    return data.map((row) => ({
+      message: row.message,
+      result: row.parsed_result,
+    }));
+  } catch (error) {
+    console.error("Error fetching examples from database:", error);
+    return [];
+  }
+}
+
+// Function to store successful parses to improve future results
+async function storeExample(message, parsedResult) {
+  try {
+    const { error } = await supabase.from("leave-examples").insert([
+      {
+        message,
+        parsed_result: parsedResult,
+        success: true,
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    if (error) throw error;
+
+    console.log("Example stored successfully!");
+  } catch (error) {
+    console.error("Error storing example:", error);
+  }
+}
+
+// Function to handle corrections for misinterpreted messages
+// async function handleCorrectedParse(originalMessage, correctedParsing) {
+//   try {
+//     // Remove any incorrect parsing from our examples
+//     // This is simplified - in practice you might need a more sophisticated approach
+//     // to identify and remove the specific incorrect example
+
+//     // Store the corrected version
+//     const combinedText = `Message: ${originalMessage}\nParsed Result: ${JSON.stringify(
+//       correctedParsing
+//     )}`;
+//     await vectorStore.addDocuments([
+//       {
+//         pageContent: combinedText,
+//         metadata: { success: true, corrected: true },
+//       },
+//     ]);
+
+//     // Update database record
+//     const { error } = await supabase.from("leave-examples").insert([
+//       {
+//         message: originalMessage,
+//         parsed_result: correctedParsing,
+//         timestamp: new Date().toISOString(),
+//         success: true,
+//         corrected: true,
+//       },
+//     ]);
+
+//     if (error) throw error;
+//     console.log("Correction successfully stored");
+//   } catch (error) {
+//     console.error("Error handling correction:", error);
+//   }
+// }
+
+// Function to initialize the vector store at application startup
+async function initializeVectorStore() {
+  try {
+    // Check if we already have examples in our vector store
+    const existingCount = await vectorStore.similaritySearch("test message", 1);
+
+    // If the store is empty, load from database
+    if (!existingCount || existingCount.length === 0) {
+      const existingExamples = await fetchExamplesFromDatabase();
+      if (existingExamples.length > 0) {
+        const documents = existingExamples.map((ex) => ({
+          pageContent: `Message: ${ex.message}\nParsed Result: ${JSON.stringify(
+            ex.result
+          )}`,
+          metadata: { success: true },
+        }));
+
+        await vectorStore.addDocuments(documents);
+        console.log(
+          `Vector store initialized with ${existingExamples.length} existing examples`
+        );
+      } else {
+        console.log(
+          "No existing examples found, starting with empty vector store"
+        );
+      }
+    } else {
+      console.log("Vector store already contains examples");
+    }
+  } catch (error) {
+    console.error("Error initializing vector store:", error);
+  }
+}
+
+// Modify the processAttendanceMessage function to use dynamic prompts
 async function processAttendanceMessage(event, client) {
   try {
+    console.log("333333333");
     // Get user info
     const userInfo = await client.users.info({
       user: event.user,
@@ -625,12 +738,35 @@ async function processAttendanceMessage(event, client) {
 
     const { category, confidence } = classificationResult;
 
-    // Get additional details
-    const detailsResult = await detailsChain.invoke({
+    // Create a dynamic prompt based on similar examples
+    const dynamicPrompt = await createDynamicDetailsPrompt(event.text);
+
+    console.log("444444444", dynamicPrompt);
+
+    // Create a dynamic details chain with the new prompt
+    const dynamicDetailsChain = RunnableSequence.from([
+      {
+        message: (input) => input.message,
+        format_instructions: () => detailsParser.getFormatInstructions(),
+      },
+      detailsPrompt,
+      aiModel,
+      detailsParser,
+    ]);
+
+    console.log("555555555");
+
+    // Get additional details using the dynamic prompt
+    const detailsResult = await dynamicDetailsChain.invoke({
       message: event.text,
     });
 
+    console.log("666666666");
+
     console.log("Extracted details:", detailsResult);
+
+    // Save the successful parse to improve future results
+    await storeExample(event.text, detailsResult);
 
     // Check for existing attendance records and handle accordingly
     await handleAttendanceRecord({
@@ -817,150 +953,102 @@ slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   }
 });
 
-async function storeAttendanceData(data) {
+// Add a Slack command for corrections
+// slackApp.command("/correct_leave", async ({ command, ack, client }) => {
+//   await ack();
+
+//   try {
+//     // Expected format: <message_ts> <json_correction>
+//     // Example: /correct_leave 1617812345.001234 {"isWorkingFromHome":true,"startDate":"2025-04-01"}
+
+//     const parts = command.text.split(" ");
+//     if (parts.length < 2) {
+//       await client.chat.postEphemeral({
+//         channel: command.channel_id,
+//         user: command.user_id,
+//         text: "Invalid format. Use: /correct_leave <message_ts> <json_correction>",
+//       });
+//       return;
+//     }
+
+//     const messageTs = parts[0];
+//     const correctionText = command.text.substring(messageTs.length).trim();
+
+//     // Parse the JSON correction
+//     let correctionJson;
+//     try {
+//       correctionJson = JSON.parse(correctionText);
+//     } catch (e) {
+//       await client.chat.postEphemeral({
+//         channel: command.channel_id,
+//         user: command.user_id,
+//         text: "Invalid JSON format for correction.",
+//       });
+//       return;
+//     }
+
+//     // Get the original message
+//     const messageResult = await client.conversations.history({
+//       channel: command.channel_id,
+//       latest: messageTs,
+//       inclusive: true,
+//       limit: 1,
+//     });
+
+//     if (!messageResult.messages || messageResult.messages.length === 0) {
+//       await client.chat.postEphemeral({
+//         channel: command.channel_id,
+//         user: command.user_id,
+//         text: "Could not find the original message.",
+//       });
+//       return;
+//     }
+
+//     const originalMessage = messageResult.messages[0].text;
+
+//     // Store the correction
+//     await handleCorrectedParse(originalMessage, correctionJson);
+
+//     await client.chat.postEphemeral({
+//       channel: command.channel_id,
+//       user: command.user_id,
+//       text: "Correction recorded. The system will learn from this.",
+//     });
+//   } catch (error) {
+//     console.error("Error processing correction:", error);
+//     await client.chat.postEphemeral({
+//       channel: command.channel_id,
+//       user: command.user_id,
+//       text: `Error processing correction: ${error.message}`,
+//     });
+//   }
+// });
+
+// Add heartbeat check to proactively monitor connection state
+let connectionHealthy = true;
+const heartbeatInterval = setInterval(async () => {
   try {
-    // Map the category directly from LLM output
-    const mappedCategory = mapAttendanceCategory(data.category);
-
-    // Ensure detailsResult values are accessed correctly
-    const {
-      startDate,
-      endDate,
-      isWorkingFromHome,
-      isLeaveRequest,
-      isRunningLate,
-      isLeavingEarly,
-    } = data.detailsResult;
-
-    // Log the extracted date information for debugging
-    console.log("Extracted date info:", {
-      startDate,
-      endDate,
-      message: data.message,
-    });
-
-    // Prepare user data
-    const userData = {
-      user_id: data.userId,
-      user_name: data.userName,
-      timestamp: new Date(parseInt(data.timestamp) * 1000).toISOString(),
-      message: data.message,
-      category: mappedCategory,
-      is_working_from_home: isWorkingFromHome,
-      is_leave_requested: isLeaveRequest,
-      is_coming_late: isRunningLate,
-      is_leave_early: isLeavingEarly,
-      first_name: data.firstName || null,
-      last_name: data.lastName || null,
-      email: data.email || null,
-      start_date: startDate,
-      end_date: endDate,
-    };
-
-    console.log("Inserting data into Supabase:", userData);
-
-    // Store in database
-    const { error } = await supabase.from("leave-table").insert([userData]);
-
-    if (error) {
-      console.error("Database error:", error);
-      throw error;
+    if (!connectionHealthy) {
+      logger.warn("Connection appears unhealthy, attempting to restart...");
+      await slackApp.stop();
+      await slackApp.start();
+      logger.info("Slack app successfully restarted");
     }
-
-    const timestampDate = new Date(parseInt(data.timestamp) * 1000);
-    const formattedDate = format(timestampDate, "dd-MMM-yyyy");
-
-    // Create detailed log entry
-    let logEntry = `${formattedDate} - ${userData.user_name} - ${userData.category} - "${userData.message}"`;
-    if (startDate) {
-      logEntry += ` (Start: ${startDate}${endDate ? `, End: ${endDate}` : ""})`;
-    }
-
-    // Log the detailed information
-    logger.info(`Attendance record: ${logEntry}`);
-
-    console.log("Data successfully stored in database");
+    // Test connection with a lightweight API call
+    await slackApp.client.auth.test();
+    connectionHealthy = true;
   } catch (error) {
-    console.error("Error storing data:", error);
-    throw error;
+    connectionHealthy = false;
+    logger.error(`Heartbeat check failed: ${error.message}`);
   }
-}
+}, 60000); // Check every minute
 
-// Modify the executeQuery function to better handle "all leaves" queries
-async function executeQuery(params) {
-  try {
-    let query = supabase.from("leave-table").select("*");
-
-    console.log("Query parameters:", params);
-
-    // ✅ Use the correct timestamps from params.filters.timestamp
-    if (params.filters?.timestamp) {
-      const { gte, lte } = params.filters.timestamp;
-      if (gte && lte) {
-        query = query.gte("timestamp", gte).lte("timestamp", lte);
-      }
-    }
-
-    // Handle category filtering
-    if (params.category) {
-      if (params.category !== "all") {
-        query = query.eq("category", params.category);
-      }
-    }
-
-    // Add additional filters if present
-    if (params.filters) {
-      Object.entries(params.filters).forEach(([key, value]) => {
-        if (key !== "timestamp" && value) {
-          query = query.eq(key, value);
-        }
-      });
-    }
-
-    // Apply limit if specified
-    if (params.limit) {
-      query = query.limit(params.limit);
-    }
-
-    console.log("Final query:", query);
-
-    // Execute query
-    const { data, error } = await query;
-
-    if (error) {
-      console.error("Query execution error:", error);
-      throw error;
-    }
-
-    console.log(`Query returned ${data.length} records`);
-
-    // Format results based on query type
-    switch (params.queryType) {
-      case "count":
-        if (params.groupBy === "user") {
-          const userCounts = {};
-          data.forEach((record) => {
-            userCounts[record.user_name] =
-              (userCounts[record.user_name] || 0) + 1;
-          });
-          return formatCountResponse(userCounts, params);
-        } else {
-          return `Found ${data.length} records matching your query.`;
-        }
-      case "list":
-        return formatListResponse(data, params);
-      case "trend":
-        return formatTrendResponse(data, params);
-      case "summary":
-        return formatSummaryResponse(data, params);
-      default:
-        return `Found ${data.length} records matching your query.`;
-    }
-  } catch (error) {
-    console.error("Error in executeQuery:", error);
-    return `Sorry, I encountered an error processing your query: ${error.message}`;
-  }
-}
+// Clean up interval on process exit
+process.on("SIGINT", () => {
+  clearInterval(heartbeatInterval);
+  slackApp.stop();
+  process.exit(0);
+});
 
 app.listen(8000, () => {
   console.log("Server is running on port 8000");
@@ -989,6 +1077,9 @@ async function testDatabaseConnection() {
 }
 
 (async () => {
+  // Initialize vector store
+  await initializeVectorStore();
+
   await slackApp.start();
   console.log("Slack Bolt app is running");
 
