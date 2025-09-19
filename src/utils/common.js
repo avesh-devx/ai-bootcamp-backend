@@ -1,4 +1,15 @@
-export function formatResponse(data) {
+function formatCategory(category) {
+  const categoryMap = {
+    wfh: "Work From Home",
+    full_leave: "Full Day Leave",
+    half_leave: "Half Day Leave",
+    leave_early: "Leave Early",
+    come_late: "Coming Late",
+  };
+  return categoryMap[category] || category;
+}
+
+module.exports.formatResponse = function formatResponse(data) {
   return data
     .map((record) => {
       const startDate = new Date(record.start_date).toLocaleDateString(
@@ -26,20 +37,11 @@ export function formatResponse(data) {
   📝 ${record.message || "No message provided"}`;
     })
     .join("\n\n");
-}
+};
 
-export function formatCategory(category) {
-  const categoryMap = {
-    wfh: "Work From Home",
-    full_leave: "Full Day Leave",
-    half_leave: "Half Day Leave",
-    leave_early: "Leave Early",
-    come_late: "Coming Late",
-  };
-  return categoryMap[category] || category;
-}
-
-export function mapAttendanceCategory(category) {
+module.exports.mapAttendanceCategory = function mapAttendanceCategory(
+  category
+) {
   const categoryMap = {
     WFH: "wfh",
     "WORK FROM HOME": "wfh",
@@ -50,9 +52,9 @@ export function mapAttendanceCategory(category) {
   };
 
   return categoryMap[category.toUpperCase()] || "unknown";
-}
+};
 
-export function calculateTimeRange(timeFrame) {
+module.exports.calculateTimeRange = function calculateTimeRange(timeFrame) {
   const now = new Date();
   let start,
     end = new Date();
@@ -86,9 +88,12 @@ export function calculateTimeRange(timeFrame) {
   }
 
   return { start: start.toISOString(), end: end.toISOString() };
-}
+};
 
-export function formatCountResponse(counts, params) {
+module.exports.formatCountResponse = function formatCountResponse(
+  counts,
+  params
+) {
   if (Object.keys(counts).length === 0) return "No matching records found.";
 
   const category = params.category || "attendance records";
@@ -107,9 +112,9 @@ export function formatCountResponse(counts, params) {
   });
 
   return response;
-}
+};
 
-export function formatListResponse(data, params) {
+module.exports.formatListResponse = function formatListResponse(data, params) {
   if (data.length === 0) return "No matching records found.";
 
   const category = params.category || "attendance records";
@@ -130,9 +135,12 @@ export function formatListResponse(data, params) {
   }
 
   return response;
-}
+};
 
-export function formatTrendResponse(data, params) {
+module.exports.formatTrendResponse = function formatTrendResponse(
+  data,
+  params
+) {
   if (data.length === 0) return "No data available for trend analysis.";
 
   const category = params.category || "attendance records";
@@ -167,9 +175,12 @@ export function formatTrendResponse(data, params) {
   });
 
   return response;
-}
+};
 
-export function formatSummaryResponse(data, params) {
+module.exports.formatSummaryResponse = function formatSummaryResponse(
+  data,
+  params
+) {
   if (data.length === 0) return "No data available for summary.";
 
   const timeFrame = formatTimeFrameText(params.timeFrame);
@@ -219,9 +230,9 @@ export function formatSummaryResponse(data, params) {
   response += `\n*Total Records:* ${data.length}`;
 
   return response;
-}
+};
 
-export function formatTimeFrameText(timeFrame) {
+module.exports.formatTimeFrameText = function formatTimeFrameText(timeFrame) {
   if (typeof timeFrame === "object" && timeFrame.start && timeFrame.end) {
     const start = new Date(timeFrame.start).toLocaleDateString();
     const end = new Date(timeFrame.end).toLocaleDateString();
@@ -240,4 +251,4 @@ export function formatTimeFrameText(timeFrame) {
     default:
       return "Selected Period";
   }
-}
+};

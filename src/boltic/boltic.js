@@ -1,84 +1,36 @@
 const express = require("express");
-const app = express();
-const { App } = require("@slack/bolt");
+const cors = require("cors");
 const dotenv = require("dotenv");
-const logger = require("./src/libs/loggerConfig");
-const supabase = require("./src/libs/supabaseClient");
+const { App } = require("@slack/bolt");
 
-// Import LangChain components
-const { StructuredOutputParser } = require("langchain/output_parsers");
-const { RunnableSequence } = require("@langchain/core/runnables");
-const { formatResponse, mapAttendanceCategory } = require("./src/utils/common");
-const { getAiModel } = require("./src/utils/initializeModel");
+// Import all Boltic services
+const { handleClassificationRequest } = require("./classification-service");
 const {
-  categorySchema,
-  detailsSchema,
-  queryParserSchema,
-} = require("./src/utils/schema");
-const {
-  classificationPrompt,
-  queryPrompt,
-  detailsPrompt,
-} = require("./src/utils/prompts");
+  handleDetailsExtractionRequest,
+} = require("./details-extraction-service");
+
+const logger = require("../libs/loggerConfig");
+const supabase = require("../libs/supabaseClient");
+const { mapAttendanceCategory, formatResponse } = require("../utils/common");
+const { handleQueryRequest } = require("./query-service");
 
 dotenv.config();
 
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
 app.use(express.json());
 
 // ---------------------------Slack app---------------------------
+
 const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN, // Bot User OAuth Token
   signingSecret: process.env.SLACK_SIGNING_SECRET, // Signing Secret
   socketMode: true, // Enable Socket Mode
   appToken: process.env.SLACK_APP_TOKEN, // App-Level Token
 });
-
-const aiModel = getAiModel();
-
-// ---------------------------LangChain Processes---------------------------
-
-// Create parsers from schemas
-const categoryParser = StructuredOutputParser.fromZodSchema(categorySchema);
-const detailsParser = StructuredOutputParser.fromZodSchema(detailsSchema);
-const queryParser = StructuredOutputParser.fromZodSchema(queryParserSchema);
-
-// We've created three AI processing chains:
-
-// classificationChain: Categorizes messages into attendance types
-// detailsChain: Extracts detailed information from messages
-// queryChain: Translates natural language queries into structured database queries
-
-// Create the classification chain using the new approach
-const classificationChain = RunnableSequence.from([
-  {
-    message: (input) => input.message,
-    format_instructions: () => categoryParser.getFormatInstructions(),
-  },
-  classificationPrompt,
-  aiModel,
-  categoryParser,
-]);
-
-const queryChain = RunnableSequence.from([
-  {
-    query: (input) => input.query,
-    format_instructions: () => queryParser.getFormatInstructions(),
-  },
-  queryPrompt,
-  aiModel,
-  queryParser,
-]);
-
-// Create the details extraction chain
-const detailsChain = RunnableSequence.from([
-  {
-    message: (input) => input.message,
-    format_instructions: () => detailsParser.getFormatInstructions(),
-  },
-  detailsPrompt,
-  aiModel,
-  detailsParser,
-]);
 
 // ---------------------------Slack event listeners---------------------------
 // Listen for messages in channels the bot is added to
@@ -107,7 +59,7 @@ slackApp.event("message", async ({ event, client }) => {
   }
 });
 
-// Separate function to process attendance messages (new or edited)
+// Function to process attendance messages (new or edited)
 async function processAttendanceMessage(event, client) {
   try {
     // Get user info
@@ -122,39 +74,31 @@ async function processAttendanceMessage(event, client) {
     const email = userInfo.user.profile.email || "";
 
     // Classify message category
-    const classificationResult = await classificationChain.invoke({
-      message: event.text,
-    });
-
-    const { category, confidence } = classificationResult;
-
-    console.log("category", { category, confidence });
-
-    // Get additional details
-    const detailsResult = await detailsChain.invoke({
-      message: event.text,
-    });
-
-    console.log("Extracted details:", detailsResult);
+    const { data: classificationResult } = await handleClassificationRequest(
+      event.text
+    );
+    const { data: detailsResult } = await handleDetailsExtractionRequest(
+      event.text
+    );
 
     // Check for existing attendance records and handle accordingly
-    // await handleAttendanceRecord({
-    //   userId: event.user,
-    //   userName: userName,
-    //   firstName: firstName,
-    //   lastName: lastName,
-    //   email: email,
-    //   timestamp: event.ts,
-    //   originalTs: event.original_ts, // Will be undefined for new messages
-    //   isEdit: event.is_edit || false,
-    //   message: event.text,
-    //   category,
-    //   confidence,
-    //   channelId: event.channel,
-    //   detailsResult: detailsResult,
-    // });
+    await handleAttendanceRecord({
+      userId: event.user,
+      userName: userName,
+      firstName: firstName,
+      lastName: lastName,
+      email: email,
+      timestamp: event.ts,
+      originalTs: event.original_ts, // Will be undefined for new messages
+      isEdit: event.is_edit || false,
+      message: event.text,
+      category: classificationResult.category,
+      confidence: classificationResult.confidence,
+      channelId: event.channel,
+      detailsResult: detailsResult,
+    });
   } catch (error) {
-    console.log("Details error", error);
+    logger.error("Details error", error);
   }
 }
 
@@ -208,7 +152,7 @@ async function handleAttendanceRecord(data) {
           .eq("id", existingRecord.id);
 
         if (updateError) throw updateError;
-        console.log("Updated existing record based on message edit");
+        logger.info("Updated existing record based on message edit");
         return;
       }
     }
@@ -236,7 +180,6 @@ async function handleAttendanceRecord(data) {
           .eq("id", mostRecentRecord.id);
 
         if (updateError) throw updateError;
-        console.log("Updated existing record based on date overlap");
 
         // If there are multiple overlapping records, we might want to delete them
         if (overlappingRecords.length > 1) {
@@ -247,9 +190,9 @@ async function handleAttendanceRecord(data) {
             .in("id", idsToDelete);
 
           if (deleteError) {
-            console.error("Error deleting redundant records:", deleteError);
+            logger.error("Error deleting redundant records:", deleteError);
           } else {
-            console.log(
+            logger.info(
               `Deleted ${idsToDelete.length} redundant overlapping records`
             );
           }
@@ -263,13 +206,11 @@ async function handleAttendanceRecord(data) {
     const { error } = await supabase.from("leave-table").insert([userData]);
 
     if (error) {
-      console.error("Database error:", error);
+      logger.error("Database error:", error);
       throw error;
     }
-
-    console.log("New attendance record created");
   } catch (error) {
-    console.error("Error handling attendance record:", error);
+    logger.error("Error handling attendance record:", error);
     throw error;
   }
 }
@@ -279,46 +220,98 @@ slackApp.command("/leave-table", async ({ command, ack, respond }) => {
   await ack();
 
   try {
-    const queryResult = await queryChain.invoke({ query: command.text });
-    console.log("queryresulttttt", queryResult);
+    // Get query parameters from Boltic AI service
+    const queryResponse = await handleQueryRequest(command.text);
 
-    // Use proper column names from your schema
-    const queryParams = {
-      queryType: queryResult.queryType || "list",
-      category: queryResult.category || "all",
-      timeFrame: queryResult.timeFrame || "day",
-      groupBy: queryResult.groupBy || "user",
-      limit: queryResult.limit || 10,
-      filters: {
-        // Use the actual start_date and end_date filters from LLM output
-        start_date: queryResult.filters?.start_date || {},
-        end_date: queryResult.filters?.end_date || {},
-        // Include timestamp only if needed for record creation time
-        timestamp: {
-          gte: queryResult.timeFrame?.start,
-          lte: queryResult.timeFrame?.end,
-        },
-      },
-    };
+    if (!queryResponse.success) {
+      throw new Error(queryResponse.error);
+    }
 
-    console.log("Final query parameters:", queryParams);
+    const queryResult = queryResponse.data;
 
-    const { data, error } = await supabase
-      .from("leave-table")
-      .select("*")
-      // Use start_date and end_date for leave period filtering
-      .lte("start_date", queryParams.filters.timestamp.lte) // Leave starts on or before end of range
-      .gte("end_date", queryParams.filters.timestamp.gte) // Leave ends on or after start of range
-      .limit(queryParams.limit);
+    // Build Supabase query based on AI response
+    let query = supabase.from("leave-table").select("*");
 
-    if (error) throw error;
+    // Apply category filters
+    if (queryResult.category && queryResult.category !== "all") {
+      query = query.eq("category", queryResult.category);
+    }
 
-    await respond(
-      data.length > 0 ? formatResponse(data) : "No matching records found"
-    );
+    // Apply boolean filters based on category
+    if (queryResult.filters) {
+      Object.entries(queryResult.filters).forEach(([key, value]) => {
+        if (typeof value === "boolean") {
+          query = query.eq(key, value);
+        } else if (typeof value === "string" && key === "user_name") {
+          query = query.ilike(key, `%${value}%`);
+        } else if (typeof value === "object" && value !== null) {
+          // Handle date range filters
+          if (value.gte) query = query.gte(key, value.gte);
+          if (value.lte) query = query.lte(key, value.lte);
+          if (value.eq) query = query.eq(key, value.eq);
+        }
+      });
+    }
+
+    // Apply date range filtering for overlapping records
+    if (queryResult.timeFrame && typeof queryResult.timeFrame === "object") {
+      const { start, end } = queryResult.timeFrame;
+      if (start && end) {
+        // Find records that overlap with the query time range
+        query = query
+          .lte("start_date", end) // Record starts before or on query end
+          .gte("end_date", start); // Record ends after or on query start
+      }
+    }
+
+    // Apply limit
+    if (queryResult.limit) {
+      query = query.limit(queryResult.limit);
+    }
+
+    // Order by timestamp for consistent results
+    query = query.order("timestamp", { ascending: false });
+
+    // Execute query
+    const { data, error } = await query;
+
+    if (error) {
+      throw error;
+    }
+
+    // Format and send response
+    if (data && data.length > 0) {
+      let responseText;
+
+      switch (queryResult.queryType) {
+        case "count":
+          responseText = `Found ${data.length} matching records.`;
+          break;
+        case "summary":
+          // Group by category or user for summary
+          const summary = {};
+          data.forEach((record) => {
+            const key =
+              queryResult.groupBy === "category"
+                ? record.category
+                : record.user_name;
+            summary[key] = (summary[key] || 0) + 1;
+          });
+          responseText = `*Summary Report:*\n${Object.entries(summary)
+            .map(([key, count]) => `• ${key}: ${count} records`)
+            .join("\n")}`;
+          break;
+        default:
+          responseText = formatResponse(data);
+      }
+
+      await respond(responseText);
+    } else {
+      await respond("No matching records found for your query.");
+    }
   } catch (error) {
-    console.error("Query execution error:", error);
-    await respond(`⚠️ Error: ${error.message.split("\n")[0]}`);
+    logger.error("Query execution error:", error);
+    await respond(`⚠️ Error processing query: ${error.message.split("\n")[0]}`);
   }
 });
 
@@ -352,12 +345,22 @@ async function testDatabaseConnection() {
 
 (async () => {
   await slackApp.start();
-  console.log("Slack Bolt app is running");
+  logger.info("Slack Bolt app is running");
 
   const dbConnected = await testDatabaseConnection();
   if (dbConnected) {
-    console.log("Database connection verified successfully");
+    logger.info("Database connection verified successfully");
   } else {
-    console.log("WARNING: Database connection issue detected");
+    logger.warn("WARNING: Database connection issue detected");
   }
 })();
+
+app.use("*", (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Endpoint not found",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+module.exports = app;
