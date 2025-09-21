@@ -8,7 +8,7 @@ const { format } = require("date-fns");
 
 // Boltic workflow URL for AI query processing
 const BOLTIC_QUERY_WORKFLOW_URL =
-  process.env.BOLTIC_CLASSIFICATION_WORKFLOW_URL ||
+  process.env.BOLTIC_WORKFLOW ||
   "https://asia-south1.workflow.boltic.app/d6ed0331-7110-4c63-9251-c34e90ae8098";
 
 // Query prompt for AI - converts natural language to database query structure
